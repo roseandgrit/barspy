@@ -1,0 +1,7 @@
+build/
+dist/
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+cc-status-bar-1.8.7/
