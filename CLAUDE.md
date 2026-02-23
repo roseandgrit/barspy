@@ -94,6 +94,10 @@ Built 2026-02-22 as replacement for AgentWatch (cc-status-bar) which had a stale
 
 Working. Shape picker (star/dot/heart/check/emoji) and color picker (8 presets + custom hex) added. App launches from Finder (py2app + Apple Dev signing). LaunchAgent enabled for auto-start on login.
 
+## Repo
+
+**GitHub:** `roseandgrit/KizWatch` (private) — https://github.com/roseandgrit/KizWatch
+
 ## Known Issues / Next Steps
 
 - Name TBD — "KizWatch" is a working title. Candidates: Glint, Blipbeat, Flicker.
