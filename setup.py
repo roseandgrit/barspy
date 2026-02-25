@@ -1,14 +1,15 @@
 from setuptools import setup
 
-APP = ['kizwatch.py']
+APP = ['barspy.py']
 OPTIONS = {
     'argv_emulation': False,
+    'iconfile': 'assets/BarSpy.icns',
     'plist': {
-        'CFBundleName': 'KizWatch',
-        'CFBundleDisplayName': 'KizWatch',
-        'CFBundleIdentifier': 'com.roseandgrit.kizwatch',
-        'CFBundleVersion': '1.0',
-        'CFBundleShortVersionString': '1.0',
+        'CFBundleName': 'Bar Spy',
+        'CFBundleDisplayName': 'Bar Spy',
+        'CFBundleIdentifier': 'com.roseandgrit.barspy',
+        'CFBundleVersion': '2.0',
+        'CFBundleShortVersionString': '2.0',
         'LSUIElement': True,
         'NSHighResolutionCapable': True,
     },

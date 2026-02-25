@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""KizWatch — Menu bar agent monitor. Colored stars, one per Claude Code session.
+"""Bar Spy — Menu bar agent monitor. Colored stars, one per Claude Code session.
 
 Single composite image approach: all session stars rendered into one menu bar icon.
 No separate NSStatusItems, no PID heartbeat. Uses session_id from Claude Code hooks.
@@ -24,8 +24,8 @@ from AppKit import (
 )
 from Foundation import NSSize
 
-STATE_FILE = Path.home() / ".kizwatch" / "sessions.json"
-CONFIG_FILE = Path.home() / ".kizwatch" / "config.json"
+STATE_FILE = Path.home() / ".barspy" / "sessions.json"
+CONFIG_FILE = Path.home() / ".barspy" / "config.json"
 DEAD_THRESHOLD = 1800.0  # 30 min no activity = assume session crashed
 
 # Default palette
@@ -40,6 +40,8 @@ DEFAULT_CONFIG = {
     "emoji": None,
     "color_working": list(DEFAULT_WORKING),
     "color_idle": list(DEFAULT_IDLE),
+    "throb_speed": "medium",
+    "notifications": True,
 }
 
 # Preset color swatches: (label, rgb_tuple)
@@ -59,6 +61,20 @@ BUILTIN_SHAPES = [
     ("dot", "Dot"),
     ("heart", "Heart"),
     ("check", "Check"),
+]
+
+THROB_SPEEDS = {
+    "off": 0.0,
+    "slow": 2 * math.pi / 3.0,    # 3s period
+    "medium": 2 * math.pi / 2.0,  # 2s period
+    "fast": 2 * math.pi / 1.0,    # 1s period
+}
+
+THROB_LABELS = [
+    ("off", "Off"),
+    ("slow", "Slow"),
+    ("medium", "Medium"),
+    ("fast", "Fast"),
 ]
 
 
@@ -88,6 +104,8 @@ def load_config():
                 data["color_working"] = list(DEFAULT_WORKING)
             if not _valid_color(data.get("color_idle")):
                 data["color_idle"] = list(DEFAULT_IDLE)
+            if data.get("throb_speed") not in THROB_SPEEDS:
+                data["throb_speed"] = "medium"
             return data
     except (json.JSONDecodeError, OSError):
         pass
@@ -116,7 +134,7 @@ def make_star_path(cx, cy, outer_r, inner_r, points=5):
     return path
 
 
-def draw_star(cx, cy, color_rgb, size=STAR_SIZE):
+def draw_star(cx, cy, color_rgb, size=STAR_SIZE, alpha=1.0):
     """Draw a star at the given center (must be in a graphics context)."""
     outer_r = size * 0.45
     inner_r = size * 0.18
@@ -127,14 +145,14 @@ def draw_star(cx, cy, color_rgb, size=STAR_SIZE):
     outline.stroke()
     # Filled star
     color = NSColor.colorWithCalibratedRed_green_blue_alpha_(
-        color_rgb[0], color_rgb[1], color_rgb[2], 1.0
+        color_rgb[0], color_rgb[1], color_rgb[2], alpha
     )
     color.set()
     star = make_star_path(cx, cy, outer_r, inner_r)
     star.fill()
 
 
-def draw_dot(cx, cy, color_rgb, size=STAR_SIZE):
+def draw_dot(cx, cy, color_rgb, size=STAR_SIZE, alpha=1.0):
     """Draw a filled circle at the given center."""
     radius = size * 0.34
     # Black outline
@@ -147,7 +165,7 @@ def draw_dot(cx, cy, color_rgb, size=STAR_SIZE):
     outline.stroke()
     # Filled circle
     color = NSColor.colorWithCalibratedRed_green_blue_alpha_(
-        color_rgb[0], color_rgb[1], color_rgb[2], 1.0
+        color_rgb[0], color_rgb[1], color_rgb[2], alpha
     )
     color.set()
     path = NSBezierPath.bezierPathWithOvalInRect_(
@@ -192,7 +210,7 @@ def make_heart_path(cx, cy, size):
     return path
 
 
-def draw_heart(cx, cy, color_rgb, size=STAR_SIZE):
+def draw_heart(cx, cy, color_rgb, size=STAR_SIZE, alpha=1.0):
     """Draw a heart at the given center."""
     # Black outline
     NSColor.blackColor().set()
@@ -201,14 +219,14 @@ def draw_heart(cx, cy, color_rgb, size=STAR_SIZE):
     outline.stroke()
     # Filled heart
     color = NSColor.colorWithCalibratedRed_green_blue_alpha_(
-        color_rgb[0], color_rgb[1], color_rgb[2], 1.0
+        color_rgb[0], color_rgb[1], color_rgb[2], alpha
     )
     color.set()
     heart = make_heart_path(cx, cy, size)
     heart.fill()
 
 
-def draw_check(cx, cy, color_rgb, size=STAR_SIZE):
+def draw_check(cx, cy, color_rgb, size=STAR_SIZE, alpha=1.0):
     """Draw a check mark at the given center."""
     s = size * 0.40
     # Three vertices: left start, bottom vertex, top-right end
@@ -229,7 +247,7 @@ def draw_check(cx, cy, color_rgb, size=STAR_SIZE):
 
     # Colored stroke on top
     color = NSColor.colorWithCalibratedRed_green_blue_alpha_(
-        color_rgb[0], color_rgb[1], color_rgb[2], 1.0
+        color_rgb[0], color_rgb[1], color_rgb[2], alpha
     )
     color.set()
     path = NSBezierPath.bezierPath()
@@ -265,7 +283,7 @@ SHAPE_DRAW_FUNCTIONS = {
 }
 
 
-def make_composite_image(session_statuses, config=None):
+def make_composite_image(session_statuses, config=None, working_alpha=1.0):
     """Render all session indicators into one menu bar image."""
     if not session_statuses:
         return None
@@ -275,7 +293,6 @@ def make_composite_image(session_statuses, config=None):
     count = len(session_statuses)
     c_working = tuple(config.get("color_working", DEFAULT_WORKING))
     c_idle = tuple(config.get("color_idle", DEFAULT_IDLE))
-    colors = [c_working if s == "working" else c_idle for s in session_statuses]
     shape = config.get("shape", "star")
     emoji_char = config.get("emoji")
 
@@ -288,14 +305,16 @@ def make_composite_image(session_statuses, config=None):
     ctx = NSGraphicsContext.graphicsContextWithBitmapImageRep_(rep)
     NSGraphicsContext.setCurrentContext_(ctx)
 
-    for i, color_rgb in enumerate(colors):
+    for i, status in enumerate(session_statuses):
         cx = i * (STAR_SIZE + STAR_GAP) + STAR_SIZE / 2
         cy = height / 2
+        color_rgb = c_working if status == "working" else c_idle
+        alpha = working_alpha if status == "working" else 1.0
         if shape == "emoji" and emoji_char:
             draw_emoji(cx, cy, emoji_char)
         else:
             draw_fn = SHAPE_DRAW_FUNCTIONS.get(shape, draw_star)
-            draw_fn(cx, cy, color_rgb)
+            draw_fn(cx, cy, color_rgb, alpha=alpha)
 
     NSGraphicsContext.setCurrentContext_(None)
 
@@ -345,16 +364,20 @@ def is_session_dead(info):
     return (time.time() - last_active) > DEAD_THRESHOLD
 
 
-class KizWatchApp(rumps.App):
+class BarSpyApp(rumps.App):
     def __init__(self):
         super().__init__(
-            name="KizWatch",
+            name="Bar Spy",
             title=None,
-            quit_button="Quit KizWatch",
+            quit_button="Quit Bar Spy",
         )
         self._initialized = False
         self._last_icon_key = None
         self._config = load_config()
+        self._throb_phase = 0.0
+        self._current_statuses = []
+        self._has_working = False
+        self._prev_session_statuses = {}  # session_id -> status, for transition detection
 
     @rumps.timer(1)
     def poll_sessions(self, _):
@@ -397,19 +420,48 @@ class KizWatchApp(rumps.App):
         # Build status list (sorted by started time for stable ordering)
         sorted_sessions = sorted(sessions.items(), key=lambda x: x[1].get("started", ""))
         statuses = [get_session_status(info) for _, info in sorted_sessions]
+        self._current_statuses = statuses
+        self._has_working = "working" in statuses
 
-        # Only redraw if something changed
-        shape_key = (
-            self._config.get("shape", "star"),
-            self._config.get("emoji", ""),
-            tuple(self._config.get("color_working", DEFAULT_WORKING)),
-            tuple(self._config.get("color_idle", DEFAULT_IDLE)),
-        )
-        icon_key = (shape_key, tuple(statuses)) if statuses else ("none",)
-        if icon_key != self._last_icon_key:
-            self._last_icon_key = icon_key
-            img = make_composite_image(statuses, self._config)
-            self._nsapp.nsstatusitem.setImage_(img)
+        # Determine if animation timer handles icon updates
+        throb_speed = self._config.get("throb_speed", "medium")
+        throbbing = throb_speed != "off" and self._has_working
+
+        if throbbing:
+            # Animation timer handles icon; invalidate cache for when throbbing stops
+            self._last_icon_key = None
+        else:
+            # Reset phase so next throb starts from full brightness
+            self._throb_phase = 0.0
+            # Only redraw if something changed
+            shape_key = (
+                self._config.get("shape", "star"),
+                self._config.get("emoji", ""),
+                tuple(self._config.get("color_working", DEFAULT_WORKING)),
+                tuple(self._config.get("color_idle", DEFAULT_IDLE)),
+            )
+            icon_key = (shape_key, tuple(statuses)) if statuses else ("none",)
+            if icon_key != self._last_icon_key:
+                self._last_icon_key = icon_key
+                img = make_composite_image(statuses, self._config)
+                self._nsapp.nsstatusitem.setImage_(img)
+
+        # Notifications: detect working → idle transitions
+        if self._config.get("notifications", True):
+            for sid, info in sorted_sessions:
+                status = get_session_status(info)
+                prev = self._prev_session_statuses.get(sid)
+                if prev == "working" and status == "idle":
+                    project = info.get("project", "Unknown")
+                    rumps.notification(
+                        title=project,
+                        subtitle="Session ready",
+                        message="Waiting for your input",
+                        sound=True,
+                    )
+        self._prev_session_statuses = {
+            sid: get_session_status(info) for sid, info in sorted_sessions
+        }
 
         # Tooltip
         if not sessions:
@@ -425,6 +477,23 @@ class KizWatchApp(rumps.App):
             self._nsapp.nsstatusitem.setToolTip_(", ".join(parts))
 
         self._rebuild_menu(sorted_sessions)
+
+    @rumps.timer(0.05)
+    def animate(self, _):
+        """Throb working indicators by cycling their alpha."""
+        if not self._initialized:
+            return
+        throb_speed = self._config.get("throb_speed", "medium")
+        if throb_speed == "off" or not self._has_working or not self._current_statuses:
+            return
+
+        omega = THROB_SPEEDS.get(throb_speed, THROB_SPEEDS["medium"])
+        self._throb_phase += 0.05 * omega
+        alpha = 0.35 + 0.65 * (0.5 + 0.5 * math.sin(self._throb_phase))
+
+        img = make_composite_image(self._current_statuses, self._config, working_alpha=alpha)
+        if img:
+            self._nsapp.nsstatusitem.setImage_(img)
 
     def _rebuild_menu(self, sorted_sessions):
         self.menu.clear()
@@ -480,6 +549,24 @@ class KizWatchApp(rumps.App):
         self._build_color_submenu("Working Color", "color_working", DEFAULT_WORKING)
         self._build_color_submenu("Idle Color", "color_idle", DEFAULT_IDLE)
 
+        # Notifications toggle
+        notif_enabled = self._config.get("notifications", True)
+        notif_item = rumps.MenuItem(
+            "Notifications", callback=self._on_toggle_notifications
+        )
+        notif_item.state = 1 if notif_enabled else 0
+        self.menu.add(notif_item)
+
+        # Throb speed submenu
+        throb_menu = rumps.MenuItem("Throb Speed")
+        current_throb = self._config.get("throb_speed", "medium")
+        for speed_key, speed_label in THROB_LABELS:
+            item = rumps.MenuItem(speed_label, callback=self._on_throb_select)
+            if current_throb == speed_key:
+                item.state = 1
+            throb_menu[speed_label] = item
+        self.menu.add(throb_menu)
+
         self.menu.add(rumps.separator)
 
     def _build_color_submenu(self, label, config_key, default_color):
@@ -515,7 +602,7 @@ class KizWatchApp(rumps.App):
         )
         window = rumps.Window(
             message="Enter a hex color (e.g. #FF6B5E or FF6B5E):",
-            title="KizWatch — Custom Color",
+            title="Bar Spy — Custom Color",
             default_text=current_hex,
             ok="Save",
             cancel=True,
@@ -535,6 +622,19 @@ class KizWatchApp(rumps.App):
                 except ValueError:
                     pass
 
+    def _on_toggle_notifications(self, sender):
+        current = self._config.get("notifications", True)
+        self._config["notifications"] = not current
+        save_config(self._config)
+
+    def _on_throb_select(self, sender):
+        for speed_key, speed_label in THROB_LABELS:
+            if speed_label == sender.title:
+                self._config["throb_speed"] = speed_key
+                save_config(self._config)
+                self._last_icon_key = None
+                return
+
     def _on_shape_select(self, sender):
         for shape_key, shape_label in BUILTIN_SHAPES:
             if shape_label == sender.title:
@@ -547,7 +647,7 @@ class KizWatchApp(rumps.App):
     def _on_emoji_select(self, sender):
         window = rumps.Window(
             message="Enter a single emoji to use as your indicator:",
-            title="KizWatch — Choose Emoji",
+            title="Bar Spy — Choose Emoji",
             default_text=self._config.get("emoji") or "",
             ok="Save",
             cancel=True,
@@ -577,4 +677,4 @@ if __name__ == "__main__":
         if alive != sessions:
             write_sessions(alive)
 
-    KizWatchApp().run()
+    BarSpyApp().run()

@@ -1,13 +1,13 @@
-# KizWatch
+# Bar Spy
 
-Menu bar agent monitor for Claude Code sessions. Shows colored stars — one per active session.
+Menu bar agent monitor for Claude Code sessions. Shows colored indicators — one per active session.
 
 ## How It Works
 
-**Hook-driven status** (learned from AgentWatch/cc-status-bar source):
+**Hook-driven status:**
 - Hooks in `~/.claude/settings.json` fire on Claude Code events
-- Hook script (`~/.claude/scripts/kizwatch_hook.py`) writes status directly to state file
-- App (`kizwatch.py`) polls state file every 1 second, renders stars
+- Hook script (`~/.claude/scripts/barspy_hook.py`) writes status directly to state file
+- App (`barspy.py`) polls state file every 1 second, renders indicators
 
 **No timestamp-based guessing.** Status is set explicitly by the hook:
 - `prompt-submit`, `tool-start`, `tool-complete` → `"working"` (teal)
@@ -19,12 +19,13 @@ Menu bar agent monitor for Claude Code sessions. Shows colored stars — one per
 
 | Component | Path | What it does |
 |-----------|------|-------------|
-| App | `kizwatch.py` | rumps menu bar app, polls state, renders stars |
-| Hook | `~/.claude/scripts/kizwatch_hook.py` | Sets session status on hook events |
-| State | `~/.kizwatch/sessions.json` | JSON with session_id → status/pid/project |
+| App | `barspy.py` | rumps menu bar app, polls state, renders indicators |
+| Hook | `~/.claude/scripts/barspy_hook.py` | Sets session status on hook events |
+| State | `~/.barspy/sessions.json` | JSON with session_id → status/pid/project |
 | Settings | `~/.claude/settings.json` | Hook wiring (6 events) |
-| Bundle | `/Applications/KizWatch.app` | py2app build, signed with Apple Dev cert |
-| LaunchAgent | `~/Library/LaunchAgents/com.kizwatch.plist` | Auto-start on login |
+| Bundle | `/Applications/Bar Spy.app` | py2app build, signed with Apple Dev cert |
+| LaunchAgent | `~/Library/LaunchAgents/com.barspy.plist` | Auto-start on login |
+| Icon | `assets/BarSpy.icns` | App icon (beret spy girl) |
 
 ## Colors
 
@@ -46,59 +47,62 @@ Users pick their indicator shape from the menu bar dropdown: **Shape >** submenu
 
 **Color picker:** "Working Color" and "Idle Color" submenus with 8 presets + custom hex input + reset to default.
 
-Config stored at `~/.kizwatch/config.json`:
+Config stored at `~/.barspy/config.json`:
 ```json
 {
   "shape": "star",
   "emoji": null,
   "color_working": [0.0, 0.85, 0.85],
-  "color_idle": [0.706, 0.624, 0.863]
+  "color_idle": [0.706, 0.624, 0.863],
+  "throb_speed": "medium",
+  "notifications": true
 }
 ```
 Validated on load; bad values fall back to defaults.
 
 ## Safety Features
 
-- **PID liveness check:** Every poll checks if session PID is alive. Dead process → star removed within 1s.
+- **PID liveness check:** Every poll checks if session PID is alive. Dead process → indicator removed within 1s.
 - **PID dedup:** If multiple session IDs share a PID (from /exit + resume), keeps only the most recently active.
 - **30-min timeout:** Fallback cleanup for sessions that somehow survive both SessionEnd hook and PID death.
+
+## Throb Animation
+
+Working indicators pulse smoothly when `throb_speed` is not `"off"`. The fill color alpha cycles on a sine wave (0.35–1.0) while the black outline stays solid. A 20fps animation timer (`@rumps.timer(0.05)`) handles rendering when throbbing; the 1s poll timer handles icon updates when not throbbing.
+
+| Speed | Period |
+|-------|--------|
+| Off | No animation |
+| Slow | 3 seconds |
+| Medium (default) | 2 seconds |
+| Fast | 1 second |
+
+Emoji shapes skip the throb (native colors can't be alpha-tinted).
+
+## Notifications
+
+Desktop notification fires when a session transitions from working → idle ("Session ready — Waiting for your input"). Toggle on/off from the menu bar dropdown. Uses `rumps.notification()` with sound.
 
 ## Build & Deploy
 
 ```bash
 cd ~/ClaudeProjects/Personal/KizWatch
 .venv/bin/python setup.py py2app
-# Kill running instance, swap bundle, sign, launch:
-kill -9 $(pgrep -f KizWatch)
-mv /Applications/KizWatch.app /Applications/KizWatch.old.app
-cp -R dist/kizwatch.app /Applications/KizWatch.app
-codesign --force --deep --sign "Apple Development: buytheclouds@gmail.com (SU2P3GG54F)" /Applications/KizWatch.app
-# Trash old, launch new
-osascript -e 'tell application "Finder" to delete POSIX file "/Applications/KizWatch.old.app"'
-open /Applications/KizWatch.app
+kill -9 $(pgrep -f "Bar Spy") 2>/dev/null
+rm -rf "/Applications/Bar Spy.app"
+cp -R "dist/Bar Spy.app" "/Applications/Bar Spy.app"
+codesign --force --deep --sign "Apple Development: buytheclouds@gmail.com (SU2P3GG54F)" "/Applications/Bar Spy.app"
+open "/Applications/Bar Spy.app"
 ```
 
-**Important:** Must rebuild with py2app after any code change — the bundle is self-contained. Hook changes (`kizwatch_hook.py`) take effect immediately (no rebuild needed).
+**Important:** Must rebuild with py2app after any code change — the bundle is self-contained. Hook changes (`barspy_hook.py`) take effect immediately (no rebuild needed).
+
+## Repo
+
+**GitHub:** `roseandgrit/barspy` (private) — https://github.com/roseandgrit/barspy
 
 ## Dependencies
 
 - Python 3.14 (venv at `.venv/`)
 - rumps, pyobjc (AppKit, Foundation)
 - py2app (build only)
-
-## History
-
-Built 2026-02-22 as replacement for AgentWatch (cc-status-bar) which had a stale indicator bug (menu bar icons persisting after sessions end). Key insight from reading AgentWatch source: status should be set directly by hooks, not guessed from timestamps.
-
-## Current State (2026-02-23)
-
-Working. Shape picker (star/dot/heart/check/emoji) and color picker (8 presets + custom hex) added. App launches from Finder (py2app + Apple Dev signing). LaunchAgent enabled for auto-start on login.
-
-## Repo
-
-**GitHub:** `roseandgrit/KizWatch` (private) — https://github.com/roseandgrit/KizWatch
-
-## Known Issues / Next Steps
-
-- Name TBD — "KizWatch" is a working title. Candidates: Glint, Blipbeat, Flicker.
-- The `cc-status-bar-1.8.7/` folder in this repo is AgentWatch source used as reference — can be deleted.
