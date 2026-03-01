@@ -1,6 +1,15 @@
 from setuptools import setup
 
 APP = ['barspy.py']
+DATA_FILES = [
+    ('icons', [
+        'assets/BarSpy.icns',
+        'assets/SpyGuy.icns',
+        'assets/spy-girl.png',
+        'assets/spy-guy.png',
+    ]),
+]
+
 OPTIONS = {
     'argv_emulation': False,
     'iconfile': 'assets/BarSpy.icns',
@@ -18,6 +27,7 @@ OPTIONS = {
 
 setup(
     app=APP,
+    data_files=DATA_FILES,
     options={'py2app': OPTIONS},
     setup_requires=['py2app'],
 )

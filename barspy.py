@@ -10,11 +10,13 @@ Cleanup via session-end events + 30-minute inactivity timeout.
 import json
 import math
 import os
+import sys
 import time
 from pathlib import Path
 
 import rumps
 from AppKit import (
+    NSApplication,
     NSBezierPath,
     NSBitmapImageRep,
     NSCalibratedRGBColorSpace,
@@ -42,7 +44,13 @@ DEFAULT_CONFIG = {
     "color_idle": list(DEFAULT_IDLE),
     "throb_speed": "medium",
     "notifications": True,
+    "app_icon": "spy-girl",
 }
+
+APP_ICON_CHOICES = [
+    ("spy-girl", "Spy Girl"),
+    ("spy-guy", "Spy Guy"),
+]
 
 # Preset color swatches: (label, rgb_tuple)
 COLOR_PRESETS = [
@@ -106,6 +114,9 @@ def load_config():
                 data["color_idle"] = list(DEFAULT_IDLE)
             if data.get("throb_speed") not in THROB_SPEEDS:
                 data["throb_speed"] = "medium"
+            valid_icons = {k for k, _ in APP_ICON_CHOICES}
+            if data.get("app_icon") not in valid_icons:
+                data["app_icon"] = "spy-girl"
             return data
     except (json.JSONDecodeError, OSError):
         pass
@@ -364,6 +375,29 @@ def is_session_dead(info):
     return (time.time() - last_active) > DEAD_THRESHOLD
 
 
+def _get_icon_path(icon_key):
+    """Get path to the icon PNG for the given app_icon key.
+
+    Checks the py2app bundle first, then falls back to local assets/.
+    """
+    icon_filename = f"{icon_key}.png"
+    # py2app bundle: Contents/Resources/icons/
+    if getattr(sys, "frozen", False):
+        bundle_dir = Path(sys.executable).parent.parent / "Resources" / "icons"
+    else:
+        bundle_dir = Path(__file__).parent / "assets"
+    return bundle_dir / icon_filename
+
+
+def _apply_app_icon(icon_key):
+    """Set the app icon (About window, Activity Monitor) to the chosen character."""
+    icon_path = _get_icon_path(icon_key)
+    if icon_path.exists():
+        img = NSImage.alloc().initByReferencingFile_(str(icon_path))
+        if img:
+            NSApplication.sharedApplication().setApplicationIconImage_(img)
+
+
 class BarSpyApp(rumps.App):
     def __init__(self):
         super().__init__(
@@ -378,6 +412,7 @@ class BarSpyApp(rumps.App):
         self._current_statuses = []
         self._has_working = False
         self._prev_session_statuses = {}  # session_id -> status, for transition detection
+        _apply_app_icon(self._config.get("app_icon", "spy-girl"))
 
     @rumps.timer(1)
     def poll_sessions(self, _):
@@ -567,6 +602,16 @@ class BarSpyApp(rumps.App):
             throb_menu[speed_label] = item
         self.menu.add(throb_menu)
 
+        # App icon submenu
+        icon_menu = rumps.MenuItem("App Icon")
+        current_icon = self._config.get("app_icon", "spy-girl")
+        for icon_key, icon_label in APP_ICON_CHOICES:
+            item = rumps.MenuItem(icon_label, callback=self._on_icon_select)
+            if current_icon == icon_key:
+                item.state = 1
+            icon_menu[icon_label] = item
+        self.menu.add(icon_menu)
+
         self.menu.add(rumps.separator)
 
     def _build_color_submenu(self, label, config_key, default_color):
@@ -633,6 +678,14 @@ class BarSpyApp(rumps.App):
                 self._config["throb_speed"] = speed_key
                 save_config(self._config)
                 self._last_icon_key = None
+                return
+
+    def _on_icon_select(self, sender):
+        for icon_key, icon_label in APP_ICON_CHOICES:
+            if icon_label == sender.title:
+                self._config["app_icon"] = icon_key
+                save_config(self._config)
+                _apply_app_icon(icon_key)
                 return
 
     def _on_shape_select(self, sender):
