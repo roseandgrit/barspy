@@ -30,8 +30,13 @@ Menu bar agent monitor for Claude Code sessions. Shows colored indicators — on
 ## Colors
 
 - **Teal** `(0.0, 0.85, 0.85)` — working (tool running, processing prompt)
+- **Amber** `(1.0, 0.75, 0.18)` — attention (likely waiting for permission prompt or user input)
 - **Pastel lavender** `(0.706, 0.624, 0.863)` / `#B49FDC` — idle (waiting for user input)
 - **Black outline** — 0.75pt stroke for visibility
+
+### Attention State
+
+If a session stays "working" for 15+ seconds without any new hook event, the app promotes it to "attention" (amber). This catches permission prompts and long pauses where Claude needs user input but no hook fires. The status reverts to "working" immediately when the next hook event fires.
 
 ## Shape Picker
 
@@ -45,7 +50,7 @@ Users pick their indicator shape from the menu bar dropdown: **Shape >** submenu
 | **Check** | Stroked polyline (3 points), thick colored stroke over black |
 | **Emoji** | Any emoji via NSAttributedString — no color tinting, native emoji colors |
 
-**Color picker:** "Working Color" and "Idle Color" submenus with 8 presets + custom hex input + reset to default.
+**Color picker:** "Working Color", "Attention Color", and "Idle Color" submenus with 8 presets + custom hex input + reset to default.
 
 Config stored at `~/.barspy/config.json`:
 ```json
@@ -53,6 +58,7 @@ Config stored at `~/.barspy/config.json`:
   "shape": "star",
   "emoji": null,
   "color_working": [0.0, 0.85, 0.85],
+  "color_attention": [1.0, 0.75, 0.18],
   "color_idle": [0.706, 0.624, 0.863],
   "throb_speed": "medium",
   "notifications": true
@@ -81,7 +87,12 @@ Emoji shapes skip the throb (native colors can't be alpha-tinted).
 
 ## Notifications
 
-Desktop notification fires when a session transitions from working → idle ("Session ready — Waiting for your input"). Toggle on/off from the menu bar dropdown. Uses `rumps.notification()` with sound.
+Desktop notifications fire on status transitions. Toggle on/off from the menu bar dropdown. Uses `rumps.notification()` with sound.
+
+- **working → attention** (after 15s): "Needs attention — Claude may be waiting for your input"
+- **working/attention → idle**: "Session ready — Waiting for your input"
+
+**Click-to-activate:** Clicking a notification brings the session's terminal/IDE (Warp, Cursor, VS Code, Terminal, etc.) to the foreground. Works by walking up the process tree from the Claude Code PID to find the owning macOS app. **Status: may not be working reliably on macOS 16 — needs debug logging if it persists.**
 
 ## Build & Deploy
 

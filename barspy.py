@@ -10,6 +10,7 @@ Cleanup via session-end events + 30-minute inactivity timeout.
 import json
 import math
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -17,21 +18,25 @@ from pathlib import Path
 import rumps
 from AppKit import (
     NSApplication,
+    NSApplicationActivateIgnoringOtherApps,
     NSBezierPath,
     NSBitmapImageRep,
     NSCalibratedRGBColorSpace,
     NSColor,
     NSGraphicsContext,
     NSImage,
+    NSRunningApplication,
 )
 from Foundation import NSSize
 
 STATE_FILE = Path.home() / ".barspy" / "sessions.json"
 CONFIG_FILE = Path.home() / ".barspy" / "config.json"
 DEAD_THRESHOLD = 1800.0  # 30 min no activity = assume session crashed
+ATTENTION_THRESHOLD = 15.0  # seconds before "working" becomes "attention" (likely waiting for permission)
 
 # Default palette
 DEFAULT_WORKING = (0.0, 0.85, 0.85)       # Teal — actively working
+DEFAULT_ATTENTION = (1.0, 0.75, 0.18)     # Amber — needs user input (permission prompt, etc.)
 DEFAULT_IDLE = (0.706, 0.624, 0.863)      # Pastel lavender #B49FDC — session alive, waiting
 
 STAR_SIZE = 18
@@ -41,6 +46,7 @@ DEFAULT_CONFIG = {
     "shape": "star",
     "emoji": None,
     "color_working": list(DEFAULT_WORKING),
+    "color_attention": list(DEFAULT_ATTENTION),
     "color_idle": list(DEFAULT_IDLE),
     "throb_speed": "medium",
     "notifications": True,
@@ -110,6 +116,8 @@ def load_config():
             # Ensure color fields exist and are valid
             if not _valid_color(data.get("color_working")):
                 data["color_working"] = list(DEFAULT_WORKING)
+            if not _valid_color(data.get("color_attention")):
+                data["color_attention"] = list(DEFAULT_ATTENTION)
             if not _valid_color(data.get("color_idle")):
                 data["color_idle"] = list(DEFAULT_IDLE)
             if data.get("throb_speed") not in THROB_SPEEDS:
@@ -303,6 +311,7 @@ def make_composite_image(session_statuses, config=None, working_alpha=1.0):
 
     count = len(session_statuses)
     c_working = tuple(config.get("color_working", DEFAULT_WORKING))
+    c_attention = tuple(config.get("color_attention", DEFAULT_ATTENTION))
     c_idle = tuple(config.get("color_idle", DEFAULT_IDLE))
     shape = config.get("shape", "star")
     emoji_char = config.get("emoji")
@@ -319,8 +328,13 @@ def make_composite_image(session_statuses, config=None, working_alpha=1.0):
     for i, status in enumerate(session_statuses):
         cx = i * (STAR_SIZE + STAR_GAP) + STAR_SIZE / 2
         cy = height / 2
-        color_rgb = c_working if status == "working" else c_idle
-        alpha = working_alpha if status == "working" else 1.0
+        if status == "working":
+            color_rgb = c_working
+        elif status == "attention":
+            color_rgb = c_attention
+        else:
+            color_rgb = c_idle
+        alpha = working_alpha if status in ("working", "attention") else 1.0
         if shape == "emoji" and emoji_char:
             draw_emoji(cx, cy, emoji_char)
         else:
@@ -351,8 +365,18 @@ def write_sessions(sessions):
 
 
 def get_session_status(info):
-    """Read status directly from the hook-set field."""
-    return info.get("status", "idle")
+    """Read status from hook, promoting 'working' to 'attention' after threshold.
+
+    If a session has been 'working' for longer than ATTENTION_THRESHOLD without
+    any new hook event, it's likely waiting for user input (permission prompt,
+    question, etc.) — display it as 'attention' instead.
+    """
+    status = info.get("status", "idle")
+    if status == "working":
+        last_active = info.get("last_active", 0.0)
+        if last_active > 0 and (time.time() - last_active) > ATTENTION_THRESHOLD:
+            return "attention"
+    return status
 
 
 def is_pid_alive(pid):
@@ -396,6 +420,43 @@ def _apply_app_icon(icon_key):
         img = NSImage.alloc().initByReferencingFile_(str(icon_path))
         if img:
             NSApplication.sharedApplication().setApplicationIconImage_(img)
+
+
+def _find_owning_app(pid):
+    """Walk up the process tree from a PID to find the macOS GUI application.
+
+    Claude Code runs inside a terminal (Warp, Terminal) or IDE (VS Code, Cursor).
+    Starting from the Claude Code PID, walk up parent PIDs until we find a process
+    that's registered as a macOS app (has a bundle identifier).
+    """
+    current = pid
+    visited = set()
+    while current > 1 and current not in visited:
+        visited.add(current)
+        app = NSRunningApplication.runningApplicationWithProcessIdentifier_(current)
+        if app and app.bundleIdentifier():
+            return app
+        try:
+            output = subprocess.check_output(
+                ["ps", "-o", "ppid=", "-p", str(current)],
+                text=True, stderr=subprocess.DEVNULL,
+            )
+            current = int(output.strip())
+        except (subprocess.CalledProcessError, ValueError):
+            break
+    return None
+
+
+@rumps.notifications
+def _handle_notification_click(data):
+    """When a Bar Spy notification is clicked, bring the session's terminal/IDE to front."""
+    if not data:
+        return
+    pid = data.get("session_pid", 0)
+    if pid:
+        app = _find_owning_app(pid)
+        if app:
+            app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
 
 
 class BarSpyApp(rumps.App):
@@ -456,7 +517,7 @@ class BarSpyApp(rumps.App):
         sorted_sessions = sorted(sessions.items(), key=lambda x: x[1].get("started", ""))
         statuses = [get_session_status(info) for _, info in sorted_sessions]
         self._current_statuses = statuses
-        self._has_working = "working" in statuses
+        self._has_working = any(s in ("working", "attention") for s in statuses)
 
         # Determine if animation timer handles icon updates
         throb_speed = self._config.get("throb_speed", "medium")
@@ -481,17 +542,27 @@ class BarSpyApp(rumps.App):
                 img = make_composite_image(statuses, self._config)
                 self._nsapp.nsstatusitem.setImage_(img)
 
-        # Notifications: detect working → idle transitions
+        # Notifications: detect status transitions
         if self._config.get("notifications", True):
             for sid, info in sorted_sessions:
                 status = get_session_status(info)
                 prev = self._prev_session_statuses.get(sid)
-                if prev == "working" and status == "idle":
+                if prev == "working" and status == "attention":
+                    project = info.get("project", "Unknown")
+                    rumps.notification(
+                        title=project,
+                        subtitle="Needs attention",
+                        message="Claude may be waiting for your input",
+                        data={"session_pid": info.get("pid", 0)},
+                        sound=True,
+                    )
+                elif prev in ("working", "attention") and status == "idle":
                     project = info.get("project", "Unknown")
                     rumps.notification(
                         title=project,
                         subtitle="Session ready",
                         message="Waiting for your input",
+                        data={"session_pid": info.get("pid", 0)},
                         sound=True,
                     )
         self._prev_session_statuses = {
@@ -503,10 +574,13 @@ class BarSpyApp(rumps.App):
             self._nsapp.nsstatusitem.setToolTip_("No active Claude sessions")
         else:
             working = statuses.count("working")
-            idle = len(statuses) - working
+            attention = statuses.count("attention")
+            idle = len(statuses) - working - attention
             parts = []
             if working:
                 parts.append(f"{working} working")
+            if attention:
+                parts.append(f"{attention} waiting")
             if idle:
                 parts.append(f"{idle} idle")
             self._nsapp.nsstatusitem.setToolTip_(", ".join(parts))
@@ -537,11 +611,16 @@ class BarSpyApp(rumps.App):
             self.menu.add(rumps.MenuItem("No active sessions", callback=None))
         else:
             working = sum(1 for _, s in sorted_sessions if get_session_status(s) == "working")
-            idle = len(sorted_sessions) - working
+            attention = sum(1 for _, s in sorted_sessions if get_session_status(s) == "attention")
+            idle = len(sorted_sessions) - working - attention
+            parts = []
             if working:
-                header = f"{working} working, {idle} idle"
-            else:
-                header = f"{len(sorted_sessions)} session{'s' if len(sorted_sessions) > 1 else ''} idle"
+                parts.append(f"{working} working")
+            if attention:
+                parts.append(f"{attention} waiting")
+            if idle:
+                parts.append(f"{idle} idle")
+            header = ", ".join(parts) if parts else f"{len(sorted_sessions)} sessions"
             self.menu.add(rumps.MenuItem(header, callback=None))
             self.menu.add(rumps.separator)
 
@@ -549,7 +628,12 @@ class BarSpyApp(rumps.App):
                 project = info.get("project", "Unknown")
                 started = info.get("started", "")
                 status = get_session_status(info)
-                icon = "●" if status == "working" else "○"
+                if status == "working":
+                    icon = "●"
+                elif status == "attention":
+                    icon = "◆"
+                else:
+                    icon = "○"
                 label = f"{icon}  {project}  —  {started}"
                 self.menu.add(rumps.MenuItem(label, callback=None))
 
@@ -582,6 +666,7 @@ class BarSpyApp(rumps.App):
 
         # Color submenus
         self._build_color_submenu("Working Color", "color_working", DEFAULT_WORKING)
+        self._build_color_submenu("Attention Color", "color_attention", DEFAULT_ATTENTION)
         self._build_color_submenu("Idle Color", "color_idle", DEFAULT_IDLE)
 
         # Notifications toggle
