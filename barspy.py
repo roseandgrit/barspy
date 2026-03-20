@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
-"""Bar Spy — Menu bar agent monitor. Colored stars, one per Claude Code session.
+"""Bar Spy — Menu bar agent monitor for Claude Code and Codex sessions.
 
-Single composite image approach: all session stars rendered into one menu bar icon.
-No separate NSStatusItems, no PID heartbeat. Uses session_id from Claude Code hooks.
-Status set directly by hooks — no timestamp-based guessing.
+Single composite image approach: all session indicators rendered into one menu bar icon.
+Claude Code: hook-driven status via ~/.barspy/sessions.json.
+Codex: SQLite polling of ~/.codex/logs_1.sqlite + state_5.sqlite (no config changes needed).
 Cleanup via session-end events + 30-minute inactivity timeout.
 """
 
 import json
 import math
 import os
+import sqlite3
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
+import objc
 import rumps
 from AppKit import (
     NSApplication,
@@ -26,13 +30,42 @@ from AppKit import (
     NSGraphicsContext,
     NSImage,
     NSRunningApplication,
+    NSSound,
 )
 from Foundation import NSSize
+from UserNotifications import (
+    UNMutableNotificationContent,
+    UNNotificationRequest,
+    UNNotificationSound,
+    UNUserNotificationCenter,
+    UNAuthorizationOptionAlert,
+    UNAuthorizationOptionSound,
+)
 
 STATE_FILE = Path.home() / ".barspy" / "sessions.json"
 CONFIG_FILE = Path.home() / ".barspy" / "config.json"
 DEAD_THRESHOLD = 1800.0  # 30 min no activity = assume session crashed
-ATTENTION_THRESHOLD = 15.0  # seconds before "working" becomes "attention" (likely waiting for permission)
+
+# Codex SQLite paths
+CODEX_LOGS_DB = Path.home() / ".codex" / "logs_1.sqlite"
+CODEX_STATE_DB = Path.home() / ".codex" / "state_5.sqlite"
+ET = ZoneInfo("America/New_York")
+
+ATTENTION_DELAYS = {
+    "off": 0.0,
+    "2min": 120.0,
+    "5min": 300.0,
+    "10min": 600.0,
+}
+
+ATTENTION_DELAY_LABELS = [
+    ("off", "Off"),
+    ("2min", "2 minutes"),
+    ("5min", "5 minutes (default)"),
+    ("10min", "10 minutes"),
+]
+
+LOG_FILE = Path.home() / ".barspy" / "debug.log"
 
 # Default palette
 DEFAULT_WORKING = (0.0, 0.85, 0.85)       # Teal — actively working
@@ -51,6 +84,7 @@ DEFAULT_CONFIG = {
     "throb_speed": "medium",
     "notifications": True,
     "app_icon": "spy-girl",
+    "attention_delay": "5min",
 }
 
 APP_ICON_CHOICES = [
@@ -122,6 +156,8 @@ def load_config():
                 data["color_idle"] = list(DEFAULT_IDLE)
             if data.get("throb_speed") not in THROB_SPEEDS:
                 data["throb_speed"] = "medium"
+            if data.get("attention_delay") not in ATTENTION_DELAYS:
+                data["attention_delay"] = "5min"
             valid_icons = {k for k, _ in APP_ICON_CHOICES}
             if data.get("app_icon") not in valid_icons:
                 data["app_icon"] = "spy-girl"
@@ -364,18 +400,193 @@ def write_sessions(sessions):
     STATE_FILE.write_text(json.dumps({"sessions": sessions}, indent=2))
 
 
-def get_session_status(info):
-    """Read status from hook, promoting 'working' to 'attention' after threshold.
+def _log(msg):
+    """Append a debug line to ~/.barspy/debug.log."""
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+    except OSError:
+        pass
 
-    If a session has been 'working' for longer than ATTENTION_THRESHOLD without
-    any new hook event, it's likely waiting for user input (permission prompt,
-    question, etc.) — display it as 'attention' instead.
+
+def scan_codex_sessions():
+    """Scan Codex SQLite databases for active threads. Returns dict of session entries.
+
+    Reads ~/.codex/logs_1.sqlite for activity and ~/.codex/state_5.sqlite for
+    thread metadata (cwd, title). No Codex config changes needed.
+    """
+    if not CODEX_LOGS_DB.exists() or not CODEX_STATE_DB.exists():
+        return {}
+
+    now = time.time()
+    cutoff = int(now) - int(DEAD_THRESHOLD)
+    sessions = {}
+
+    try:
+        conn = sqlite3.connect(f"file:{CODEX_LOGS_DB}?mode=ro", uri=True, timeout=1)
+        conn.execute(f"ATTACH DATABASE 'file:{CODEX_STATE_DB}?mode=ro' AS state_db")
+
+        # Find threads with recent log activity
+        rows = conn.execute("""
+            SELECT
+                l.thread_id,
+                t.cwd,
+                t.title,
+                MAX(l.ts) as last_ts,
+                t.created_at
+            FROM logs l
+            JOIN state_db.threads t ON l.thread_id = t.id
+            WHERE l.thread_id IS NOT NULL
+              AND l.ts > ?
+              AND t.archived = 0
+            GROUP BY l.thread_id
+            ORDER BY last_ts DESC
+        """, (cutoff,)).fetchall()
+
+        for thread_id, cwd, title, last_ts, created_at in rows:
+            # Get the last significant log entry for state detection
+            event_row = conn.execute("""
+                SELECT target, message
+                FROM logs
+                WHERE thread_id = ?
+                  AND target IN (
+                    'codex_app_server::outgoing_message',
+                    'codex_core::codex',
+                    'codex_core::stream_events_utils',
+                    'codex_api::sse::responses',
+                    'codex_api::endpoint::responses_websocket'
+                  )
+                ORDER BY ts DESC, ts_nanos DESC
+                LIMIT 1
+            """, (thread_id,)).fetchone()
+
+            status = _codex_status_from_log(last_ts, event_row, now)
+            if status is None:
+                continue  # dead, skip
+
+            project = Path(cwd).name if cwd else "Unknown"
+            started = datetime.fromtimestamp(created_at, tz=ET).strftime("%-I:%M %p")
+
+            sid = f"codex:{thread_id}"
+            sessions[sid] = {
+                "agent_type": "codex",
+                "pid": 0,  # filled in below
+                "project": project,
+                "cwd": cwd or "",
+                "started": started,
+                "status": status,
+                "last_active": float(last_ts),
+                "last_event": _codex_last_event(event_row),
+                "thread_id": thread_id,
+            }
+
+        conn.close()
+    except (sqlite3.Error, OSError) as e:
+        _log(f"Codex scan error: {e}")
+        return {}
+
+    # Find Codex app-server PID for liveness check
+    if sessions:
+        codex_pid = _find_codex_pid()
+        for info in sessions.values():
+            info["pid"] = codex_pid
+
+    return sessions
+
+
+def _codex_status_from_log(last_ts, event_row, now):
+    """Determine Codex session status from the last significant log entry."""
+    age = now - last_ts
+
+    # Dead: no activity in 30 min
+    if age > DEAD_THRESHOLD:
+        return None
+
+    if event_row:
+        target, message = event_row
+        msg = (message or "").lower()
+
+        # Explicit idle: model finished responding
+        if ("response.completed" in msg or "turn/completed" in msg
+                or message == "post sampling token usage"):
+            return "idle"
+
+        # Explicit working: user just submitted a prompt
+        if message == "Submission":
+            return "working"
+
+    # Recent activity = working (streaming, tool calls, etc.)
+    if age < 10:
+        return "working"
+
+    # Stale with no completion marker = idle
+    return "idle"
+
+
+def _codex_last_event(event_row):
+    """Map Codex log entry to a last_event string for attention logic."""
+    if not event_row:
+        return ""
+    target, message = event_row
+    msg = (message or "").lower()
+    if ("response.completed" in msg or "turn/completed" in msg
+            or message == "post sampling token usage"):
+        return "turn-complete"
+    if message == "Submission":
+        return "submission"
+    if "toolcall" in msg.replace(" ", "").lower():
+        return "tool-call"
+    return "streaming"
+
+
+def _find_codex_pid():
+    """Find the Codex app-server PID (or main Codex.app PID)."""
+    try:
+        output = subprocess.check_output(
+            ["pgrep", "-f", "codex app-server"],
+            text=True, stderr=subprocess.DEVNULL,
+        )
+        pids = [int(p) for p in output.strip().split("\n") if p.strip()]
+        if pids:
+            return pids[0]
+    except (subprocess.CalledProcessError, ValueError):
+        pass
+    # Fallback: look for main Codex process
+    try:
+        output = subprocess.check_output(
+            ["pgrep", "-x", "Codex"],
+            text=True, stderr=subprocess.DEVNULL,
+        )
+        pids = [int(p) for p in output.strip().split("\n") if p.strip()]
+        if pids:
+            return pids[0]
+    except (subprocess.CalledProcessError, ValueError):
+        pass
+    return 0
+
+
+def get_session_status(info, config=None):
+    """Promote idle to attention after threshold. Works for both Claude and Codex.
+
+    Claude: promotes after tool-complete with no follow-up for configured delay.
+    Codex: promotes after turn-complete (idle) with no new activity for configured delay.
+    Dismissed: if user clicked notification/session, suppress until new activity.
     """
     status = info.get("status", "idle")
-    if status == "working":
-        last_active = info.get("last_active", 0.0)
-        if last_active > 0 and (time.time() - last_active) > ATTENTION_THRESHOLD:
-            return "attention"
+    last_event = info.get("last_event", "")
+
+    # Attention promotion for idle sessions (both agents)
+    # Claude: after tool-complete; Codex: after turn-complete
+    promotable_events = ("tool-complete", "turn-complete")
+    if status in ("working", "idle") and last_event in promotable_events:
+        delay_key = (config or {}).get("attention_delay", "5min")
+        threshold = ATTENTION_DELAYS.get(delay_key, 0.0)
+        if threshold > 0:
+            last_active = info.get("last_active", 0.0)
+            if last_active > 0 and (time.time() - last_active) > threshold:
+                dismissed_at = info.get("attention_dismissed_at", 0.0)
+                if dismissed_at < last_active:
+                    return "attention"
     return status
 
 
@@ -447,16 +658,126 @@ def _find_owning_app(pid):
     return None
 
 
-@rumps.notifications
-def _handle_notification_click(data):
-    """When a Bar Spy notification is clicked, bring the session's terminal/IDE to front."""
-    if not data:
+def _activate_via_applescript(bundle_id):
+    """Fallback activation using AppleScript — more reliable on macOS 14+."""
+    try:
+        subprocess.run(
+            ["osascript", "-e", f'tell application id "{bundle_id}" to activate'],
+            check=True, timeout=5, capture_output=True,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _dismiss_attention_for_pid(pid):
+    """Mark attention as dismissed for the session with this PID."""
+    if not pid:
         return
-    pid = data.get("session_pid", 0)
-    if pid:
-        app = _find_owning_app(pid)
-        if app:
-            app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
+    sessions = read_sessions()
+    changed = False
+    for info in sessions.values():
+        if info.get("pid") == pid:
+            info["attention_dismissed_at"] = time.time()
+            changed = True
+    if changed:
+        write_sessions(sessions)
+
+
+def _activate_codex():
+    """Bring the Codex desktop app to the foreground."""
+    _log("Activating Codex.app")
+    apps = NSRunningApplication.runningApplicationsWithBundleIdentifier_("com.openai.codex")
+    if apps and len(apps) > 0:
+        apps[0].activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
+    else:
+        _activate_via_applescript("com.openai.codex")
+
+
+def _handle_notification_click(pid):
+    """Bring the session's terminal/IDE to front given the Claude Code PID."""
+    _log(f"Handling click for PID {pid}")
+    if not pid:
+        return
+    _dismiss_attention_for_pid(pid)
+    app = _find_owning_app(pid)
+    if app:
+        bundle_id = app.bundleIdentifier()
+        _log(f"Found app: {app.localizedName()} ({bundle_id})")
+        result = app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
+        _log(f"activateWithOptions_ result: {result}")
+        if not result:
+            _log("Trying AppleScript fallback")
+            ok = _activate_via_applescript(bundle_id)
+            _log(f"AppleScript result: {ok}")
+    else:
+        _log(f"No owning app found for PID {pid}")
+
+
+# --- UNUserNotificationCenter delegate (modern macOS notification clicks) ---
+
+class NotificationDelegate(objc.lookUpClass("NSObject")):
+    """Handles notification click responses via UNUserNotificationCenter."""
+
+    def userNotificationCenter_didReceiveNotificationResponse_withCompletionHandler_(
+        self, center, response, handler
+    ):
+        """Called when user clicks a notification."""
+        try:
+            user_info = response.notification().request().content().userInfo()
+            agent_type = user_info.get("agent_type", "claude") if user_info else "claude"
+            pid = user_info.get("session_pid", 0) if user_info else 0
+            _log(f"UN click - agent={agent_type} pid={pid}")
+            if agent_type == "codex":
+                _activate_codex()
+            elif pid:
+                _handle_notification_click(int(pid))
+        except Exception as e:
+            _log(f"UN click error: {e}")
+        handler()
+
+    def userNotificationCenter_willPresentNotification_withCompletionHandler_(
+        self, center, notification, handler
+    ):
+        """Show notifications even when app is in foreground (menu bar app)."""
+        # UNNotificationPresentationOptionBanner | UNNotificationPresentationOptionSound
+        handler(0x10 | 0x02)
+
+
+def _setup_notifications():
+    """Initialize UNUserNotificationCenter with our delegate and request auth."""
+    center = UNUserNotificationCenter.currentNotificationCenter()
+    delegate = NotificationDelegate.alloc().init()
+    center.setDelegate_(delegate)
+    # Request authorization (needed once; macOS remembers the choice)
+    center.requestAuthorizationWithOptions_completionHandler_(
+        UNAuthorizationOptionAlert | UNAuthorizationOptionSound,
+        lambda granted, error: _log(f"Notification auth: granted={granted} error={error}"),
+    )
+    return delegate  # prevent GC
+
+
+def _send_notification(title, subtitle, message, session_pid=0, agent_type="claude"):
+    """Send a notification via UNUserNotificationCenter with click-to-activate data."""
+    content = UNMutableNotificationContent.alloc().init()
+    content.setTitle_(title)
+    content.setSubtitle_(subtitle)
+    content.setBody_(message)
+    content.setSound_(UNNotificationSound.defaultSound())
+    user_info = {"agent_type": agent_type}
+    if session_pid:
+        user_info["session_pid"] = session_pid
+    content.setUserInfo_(user_info)
+
+    request = UNNotificationRequest.requestWithIdentifier_content_trigger_(
+        f"barspy-{time.time()}", content, None
+    )
+    center = UNUserNotificationCenter.currentNotificationCenter()
+    center.addNotificationRequest_withCompletionHandler_(
+        request,
+        lambda error: _log(f"Notification send error: {error}") if error else None,
+    )
+    _log(f"Sent notification: {title} / {subtitle} (pid={session_pid})")
 
 
 class BarSpyApp(rumps.App):
@@ -473,6 +794,7 @@ class BarSpyApp(rumps.App):
         self._current_statuses = []
         self._has_working = False
         self._prev_session_statuses = {}  # session_id -> status, for transition detection
+        self._notif_delegate = _setup_notifications()  # keep ref to prevent GC
         _apply_app_icon(self._config.get("app_icon", "spy-girl"))
 
     @rumps.timer(1)
@@ -486,9 +808,10 @@ class BarSpyApp(rumps.App):
             self._nsapp.nsstatusitem.setTitle_("")
             self._initialized = True
 
+        # --- Claude Code sessions (from hook-driven JSON) ---
         sessions = read_sessions()
 
-        # Dedup: if multiple sessions share a PID, keep only the most recently active
+        # Dedup: if multiple Claude sessions share a PID, keep most recently active
         pid_best = {}
         for sid, info in sessions.items():
             pid = info.get("pid", 0)
@@ -505,7 +828,7 @@ class BarSpyApp(rumps.App):
                 del sessions[sid]
             write_sessions(sessions)
 
-        # Cleanup: remove sessions whose process is dead OR inactive 30+ min
+        # Cleanup: remove Claude sessions whose process is dead OR inactive 30+ min
         dead_ids = [sid for sid, info in sessions.items()
                      if is_session_dead(info) or not is_pid_alive(info.get("pid", 0))]
         if dead_ids:
@@ -513,9 +836,13 @@ class BarSpyApp(rumps.App):
                 del sessions[sid]
             write_sessions(sessions)
 
+        # --- Codex sessions (from SQLite polling) ---
+        codex_sessions = scan_codex_sessions()
+        sessions.update(codex_sessions)
+
         # Build status list (sorted by started time for stable ordering)
         sorted_sessions = sorted(sessions.items(), key=lambda x: x[1].get("started", ""))
-        statuses = [get_session_status(info) for _, info in sorted_sessions]
+        statuses = [get_session_status(info, self._config) for _, info in sorted_sessions]
         self._current_statuses = statuses
         self._has_working = any(s in ("working", "attention") for s in statuses)
 
@@ -545,33 +872,37 @@ class BarSpyApp(rumps.App):
         # Notifications: detect status transitions
         if self._config.get("notifications", True):
             for sid, info in sorted_sessions:
-                status = get_session_status(info)
+                status = get_session_status(info, self._config)
                 prev = self._prev_session_statuses.get(sid)
                 if prev == "working" and status == "attention":
                     project = info.get("project", "Unknown")
-                    rumps.notification(
+                    agent_type = info.get("agent_type", "claude")
+                    agent = "Codex" if agent_type == "codex" else "Claude"
+                    _send_notification(
                         title=project,
                         subtitle="Needs attention",
-                        message="Claude may be waiting for your input",
-                        data={"session_pid": info.get("pid", 0)},
-                        sound=True,
+                        message=f"{agent} may be waiting for your input",
+                        session_pid=info.get("pid", 0),
+                        agent_type=agent_type,
                     )
                 elif prev in ("working", "attention") and status == "idle":
                     project = info.get("project", "Unknown")
-                    rumps.notification(
+                    agent_type = info.get("agent_type", "claude")
+                    agent = "Codex" if agent_type == "codex" else "Claude"
+                    _send_notification(
                         title=project,
                         subtitle="Session ready",
-                        message="Waiting for your input",
-                        data={"session_pid": info.get("pid", 0)},
-                        sound=True,
+                        message=f"{agent} is waiting for your input",
+                        session_pid=info.get("pid", 0),
+                        agent_type=agent_type,
                     )
         self._prev_session_statuses = {
-            sid: get_session_status(info) for sid, info in sorted_sessions
+            sid: get_session_status(info, self._config) for sid, info in sorted_sessions
         }
 
         # Tooltip
         if not sessions:
-            self._nsapp.nsstatusitem.setToolTip_("No active Claude sessions")
+            self._nsapp.nsstatusitem.setToolTip_("No active sessions")
         else:
             working = statuses.count("working")
             attention = statuses.count("attention")
@@ -610,8 +941,8 @@ class BarSpyApp(rumps.App):
         if not sorted_sessions:
             self.menu.add(rumps.MenuItem("No active sessions", callback=None))
         else:
-            working = sum(1 for _, s in sorted_sessions if get_session_status(s) == "working")
-            attention = sum(1 for _, s in sorted_sessions if get_session_status(s) == "attention")
+            working = sum(1 for _, s in sorted_sessions if get_session_status(s, self._config) == "working")
+            attention = sum(1 for _, s in sorted_sessions if get_session_status(s, self._config) == "attention")
             idle = len(sorted_sessions) - working - attention
             parts = []
             if working:
@@ -624,18 +955,24 @@ class BarSpyApp(rumps.App):
             self.menu.add(rumps.MenuItem(header, callback=None))
             self.menu.add(rumps.separator)
 
-            for _, info in sorted_sessions:
+            for sid, info in sorted_sessions:
                 project = info.get("project", "Unknown")
                 started = info.get("started", "")
-                status = get_session_status(info)
+                agent_tag = "Codex" if info.get("agent_type") == "codex" else "Claude"
+                status = get_session_status(info, self._config)
                 if status == "working":
                     icon = "●"
                 elif status == "attention":
                     icon = "◆"
                 else:
                     icon = "○"
-                label = f"{icon}  {project}  —  {started}"
-                self.menu.add(rumps.MenuItem(label, callback=None))
+                label = f"{icon}  {project} ({agent_tag})  —  {started}"
+                pid = info.get("pid", 0)
+                if info.get("agent_type") == "codex":
+                    cb = (lambda s: lambda _: _activate_codex())(sid)
+                else:
+                    cb = (lambda p: lambda _: _dismiss_attention_for_pid(p))(pid)
+                self.menu.add(rumps.MenuItem(label, callback=cb))
 
         self.menu.add(rumps.separator)
 
@@ -686,6 +1023,16 @@ class BarSpyApp(rumps.App):
                 item.state = 1
             throb_menu[speed_label] = item
         self.menu.add(throb_menu)
+
+        # Attention delay submenu
+        attn_menu = rumps.MenuItem("Attention Delay")
+        current_attn = self._config.get("attention_delay", "5min")
+        for delay_key, delay_label in ATTENTION_DELAY_LABELS:
+            item = rumps.MenuItem(delay_label, callback=self._on_attention_delay_select)
+            if current_attn == delay_key:
+                item.state = 1
+            attn_menu[delay_label] = item
+        self.menu.add(attn_menu)
 
         # App icon submenu
         icon_menu = rumps.MenuItem("App Icon")
@@ -763,6 +1110,13 @@ class BarSpyApp(rumps.App):
                 self._config["throb_speed"] = speed_key
                 save_config(self._config)
                 self._last_icon_key = None
+                return
+
+    def _on_attention_delay_select(self, sender):
+        for delay_key, delay_label in ATTENTION_DELAY_LABELS:
+            if delay_label == sender.title:
+                self._config["attention_delay"] = delay_key
+                save_config(self._config)
                 return
 
     def _on_icon_select(self, sender):
