@@ -120,7 +120,7 @@ cd ~/ClaudeProjects/Personal/BarSpy
 kill -9 $(pgrep -f "Bar Spy") 2>/dev/null
 mv "/Applications/Bar Spy.app" "/tmp/BarSpy_old_$(date +%s).app"
 cp -R "dist/Bar Spy.app" "/Applications/Bar Spy.app"
-codesign --force --deep --sign "Apple Development: buytheclouds@gmail.com (SU2P3GG54F)" "/Applications/Bar Spy.app"
+codesign --force --deep --sign "Your Developer ID" "/Applications/Bar Spy.app"
 open "/Applications/Bar Spy.app"
 ```
 
