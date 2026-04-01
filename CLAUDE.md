@@ -130,7 +130,7 @@ open "/Applications/Bar Spy.app"
 
 ## Repo
 
-**GitHub:** `roseandgrit/barspy` (private) — https://github.com/roseandgrit/barspy
+**GitHub:** `roseandgrit/barspy` (public) — https://github.com/roseandgrit/barspy
 
 ## Dependencies
 
