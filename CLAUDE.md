@@ -132,8 +132,29 @@ open "/Applications/Bar Spy.app"
 
 **GitHub:** `roseandgrit/barspy` (public) — https://github.com/roseandgrit/barspy
 
+## Session Management
+
+Each session in the dropdown is a submenu with:
+- **Activate** — brings the session's terminal/IDE to the foreground
+- **Remove** — dismisses the session from display (Claude: removed from JSON; Codex: in-memory ignore until restart)
+
+**Quit Bar Spy** item at the bottom of the menu (explicit item, not rumps built-in — `menu.clear()` on every poll was swallowing the rumps quit button).
+
 ## Dependencies
 
 - Python 3.14 (venv at `.venv/`)
 - rumps, pyobjc (AppKit, Foundation)
 - py2app (build only)
+
+## Current Status
+
+Fully working. Session removal + quit menu item on branch `feat/session-management`, pushed to origin. App rebuilt and running.
+
+## Last Session
+
+**2026-04-12** — Added session management: per-session Activate/Remove submenu, explicit Quit item. Fixed rumps quit button being swallowed by `menu.clear()`. Built, deployed, tested.
+
+## Next Steps
+
+- Merge `feat/session-management` to master
+- Consider: "Kill Process" option (sends SIGTERM) in addition to "Remove" (display-only)
