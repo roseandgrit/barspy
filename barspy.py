@@ -785,7 +785,7 @@ class BarSpyApp(rumps.App):
         super().__init__(
             name="Bar Spy",
             title=None,
-            quit_button="Quit Bar Spy",
+            quit_button=None,
         )
         self._initialized = False
         self._last_icon_key = None
@@ -794,6 +794,7 @@ class BarSpyApp(rumps.App):
         self._current_statuses = []
         self._has_working = False
         self._prev_session_statuses = {}  # session_id -> status, for transition detection
+        self._ignored_sessions = set()  # user-removed session IDs (survives until restart)
         self._notif_delegate = _setup_notifications()  # keep ref to prevent GC
         _apply_app_icon(self._config.get("app_icon", "spy-girl"))
 
@@ -839,6 +840,10 @@ class BarSpyApp(rumps.App):
         # --- Codex sessions (from SQLite polling) ---
         codex_sessions = scan_codex_sessions()
         sessions.update(codex_sessions)
+
+        # Filter out user-dismissed sessions
+        for sid in list(self._ignored_sessions):
+            sessions.pop(sid, None)
 
         # Build status list (sorted by started time for stable ordering)
         sorted_sessions = sorted(sessions.items(), key=lambda x: x[1].get("started", ""))
@@ -968,11 +973,22 @@ class BarSpyApp(rumps.App):
                     icon = "○"
                 label = f"{icon}  {project} ({agent_tag})  —  {started}"
                 pid = info.get("pid", 0)
+                session_submenu = rumps.MenuItem(label)
+                # Activate: bring session's app to foreground
                 if info.get("agent_type") == "codex":
-                    cb = (lambda s: lambda _: _activate_codex())(sid)
+                    activate_cb = (lambda s: lambda _: _activate_codex())(sid)
                 else:
-                    cb = (lambda p: lambda _: _dismiss_attention_for_pid(p))(pid)
-                self.menu.add(rumps.MenuItem(label, callback=cb))
+                    activate_cb = (lambda p: lambda _: (
+                        _dismiss_attention_for_pid(p),
+                        _handle_notification_click(p),
+                    ))(pid)
+                session_submenu["Activate"] = rumps.MenuItem("Activate", callback=activate_cb)
+                # Remove: dismiss session from display
+                remove_cb = (lambda s, a: lambda _: self._on_remove_session(s, a))(
+                    sid, info.get("agent_type", "claude")
+                )
+                session_submenu["Remove"] = rumps.MenuItem("Remove", callback=remove_cb)
+                self.menu.add(session_submenu)
 
         self.menu.add(rumps.separator)
 
@@ -1045,6 +1061,17 @@ class BarSpyApp(rumps.App):
         self.menu.add(icon_menu)
 
         self.menu.add(rumps.separator)
+        self.menu.add(rumps.MenuItem("Quit Bar Spy", callback=lambda _: rumps.quit_application()))
+
+    def _on_remove_session(self, sid, agent_type):
+        """Remove a session from the display."""
+        if agent_type == "codex":
+            self._ignored_sessions.add(sid)
+        else:
+            sessions = read_sessions()
+            sessions.pop(sid, None)
+            write_sessions(sessions)
+        self._last_icon_key = None  # force icon redraw
 
     def _build_color_submenu(self, label, config_key, default_color):
         """Build a color picker submenu with presets + custom hex input."""
