@@ -3,7 +3,7 @@
 
 Single composite image approach: all session indicators rendered into one menu bar icon.
 Claude Code: hook-driven status via ~/.barspy/sessions.json.
-Codex: SQLite polling of ~/.codex/logs_1.sqlite + state_5.sqlite (no config changes needed).
+Codex: SQLite polling of the latest ~/.codex/logs_*.sqlite + state_*.sqlite (no config changes needed).
 Cleanup via session-end events + 30-minute inactivity timeout.
 """
 
@@ -46,9 +46,28 @@ STATE_FILE = Path.home() / ".barspy" / "sessions.json"
 CONFIG_FILE = Path.home() / ".barspy" / "config.json"
 DEAD_THRESHOLD = 1800.0  # 30 min no activity = assume session crashed
 
-# Codex SQLite paths
-CODEX_LOGS_DB = Path.home() / ".codex" / "logs_1.sqlite"
-CODEX_STATE_DB = Path.home() / ".codex" / "state_5.sqlite"
+# Codex SQLite paths. The Codex app bumps the numeric suffix when it rotates a
+# database (logs_1 -> logs_2, state_5 -> state_6, etc.), so we glob for the
+# highest-numbered file rather than hardcoding a number. Resolved fresh on each
+# poll so Bar Spy survives a rotation that happens mid-session.
+CODEX_DIR = Path.home() / ".codex"
+
+
+def _latest_codex_db(prefix):
+    """Return the highest-numbered ~/.codex/<prefix>_N.sqlite, or None if absent."""
+    best = None
+    best_n = -1
+    for path in CODEX_DIR.glob(f"{prefix}_*.sqlite"):
+        try:
+            n = int(path.stem[len(prefix) + 1:])
+        except ValueError:
+            continue
+        if n > best_n:
+            best_n = n
+            best = path
+    return best
+
+
 ET = ZoneInfo("America/New_York")
 
 ATTENTION_DELAYS = {
@@ -412,10 +431,14 @@ def _log(msg):
 def scan_codex_sessions():
     """Scan Codex SQLite databases for active threads. Returns dict of session entries.
 
-    Reads ~/.codex/logs_1.sqlite for activity and ~/.codex/state_5.sqlite for
-    thread metadata (cwd, title). No Codex config changes needed.
+    Reads the latest ~/.codex/logs_*.sqlite for activity and the latest
+    ~/.codex/state_*.sqlite for thread metadata (cwd, title). The numeric suffix
+    rotates over time, so the actual files are resolved fresh on each poll. No
+    Codex config changes needed.
     """
-    if not CODEX_LOGS_DB.exists() or not CODEX_STATE_DB.exists():
+    logs_db = _latest_codex_db("logs")
+    state_db = _latest_codex_db("state")
+    if logs_db is None or state_db is None:
         return {}
 
     now = time.time()
@@ -423,8 +446,8 @@ def scan_codex_sessions():
     sessions = {}
 
     try:
-        conn = sqlite3.connect(f"file:{CODEX_LOGS_DB}?mode=ro", uri=True, timeout=1)
-        conn.execute(f"ATTACH DATABASE 'file:{CODEX_STATE_DB}?mode=ro' AS state_db")
+        conn = sqlite3.connect(f"file:{logs_db}?mode=ro", uri=True, timeout=1)
+        conn.execute(f"ATTACH DATABASE 'file:{state_db}?mode=ro' AS state_db")
 
         # Find threads with recent log activity
         rows = conn.execute("""
@@ -446,15 +469,15 @@ def scan_codex_sessions():
         for thread_id, cwd, title, last_ts, created_at in rows:
             # Get the last significant log entry for state detection
             event_row = conn.execute("""
-                SELECT target, message
+                SELECT target, feedback_log_body
                 FROM logs
                 WHERE thread_id = ?
                   AND target IN (
-                    'codex_app_server::outgoing_message',
-                    'codex_core::codex',
-                    'codex_core::stream_events_utils',
+                    'codex_api::endpoint::responses_websocket',
                     'codex_api::sse::responses',
-                    'codex_api::endpoint::responses_websocket'
+                    'codex_core::stream_events_utils',
+                    'codex_core::session::turn',
+                    'codex_core::session::handlers'
                   )
                 ORDER BY ts DESC, ts_nanos DESC
                 LIMIT 1
@@ -494,6 +517,22 @@ def scan_codex_sessions():
     return sessions
 
 
+def _codex_completed(msg):
+    """True if the log body shows the model finished a turn (terminal event).
+
+    The body is an OpenTelemetry span path plus a trailing message; the model's
+    completion shows up as a `{"type":"response.completed"}` websocket event (or
+    response.failed/incomplete, or a turn/completed app event). The span path
+    itself always carries `op.dispatch.user_input`, so only these terminal
+    substrings can be trusted to mean "done" — never the span path.
+    """
+    return ("response.completed" in msg
+            or "response.failed" in msg
+            or "response.incomplete" in msg
+            or "turn/completed" in msg
+            or "turn.completed" in msg)
+
+
 def _codex_status_from_log(last_ts, event_row, now):
     """Determine Codex session status from the last significant log entry."""
     age = now - last_ts
@@ -503,19 +542,14 @@ def _codex_status_from_log(last_ts, event_row, now):
         return None
 
     if event_row:
-        target, message = event_row
-        msg = (message or "").lower()
-
+        _, body = event_row
         # Explicit idle: model finished responding
-        if ("response.completed" in msg or "turn/completed" in msg
-                or message == "post sampling token usage"):
+        if _codex_completed((body or "").lower()):
             return "idle"
 
-        # Explicit working: user just submitted a prompt
-        if message == "Submission":
-            return "working"
-
-    # Recent activity = working (streaming, tool calls, etc.)
+    # Recent activity = working (streaming, tool calls, reasoning, etc.).
+    # The new span-based log format has no discrete "started" message that is
+    # distinguishable from the span path, so working is detected by recency.
     if age < 10:
         return "working"
 
@@ -527,14 +561,11 @@ def _codex_last_event(event_row):
     """Map Codex log entry to a last_event string for attention logic."""
     if not event_row:
         return ""
-    target, message = event_row
-    msg = (message or "").lower()
-    if ("response.completed" in msg or "turn/completed" in msg
-            or message == "post sampling token usage"):
+    _, body = event_row
+    msg = (body or "").lower()
+    if _codex_completed(msg):
         return "turn-complete"
-    if message == "Submission":
-        return "submission"
-    if "toolcall" in msg.replace(" ", "").lower():
+    if "exec_command" in msg or "tool_call" in msg or "toolcall" in msg.replace(" ", ""):
         return "tool-call"
     return "streaming"
 
