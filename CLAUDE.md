@@ -79,6 +79,14 @@ Config stored at `~/.barspy/config.json`:
 ```
 Validated on load; bad values fall back to defaults.
 
+## Session Menu
+
+Each active session is a submenu (`● project (Claude) — 2:31 PM`) with two items:
+- **Activate** — brings the session's app to the foreground. Claude → `_handle_notification_click(pid)` (dismisses attention + walks the process tree to the owning terminal/IDE); Codex → `_activate_codex()` (bundle ID).
+- **Remove** — manually clears the session from the display. Claude sessions are popped from `sessions.json` (reappear if the hook writes a new event). Codex sessions are re-derived from SQLite every poll, so removal adds the session ID to an in-memory ignore set (`_ignored_sessions`) that suppresses it until app restart.
+
+Removal is for clearing sessions you don't care about now; auto-cleanup (below) still handles dead/stale ones on its own.
+
 ## Safety Features
 
 - **PID liveness check:** Every poll checks if session PID is alive. Dead Claude process → indicator removed within 1s. Codex sessions track the app-server PID — if Codex.app quits, all Codex indicators are removed.

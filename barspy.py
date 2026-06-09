@@ -825,6 +825,7 @@ class BarSpyApp(rumps.App):
         self._current_statuses = []
         self._has_working = False
         self._prev_session_statuses = {}  # session_id -> status, for transition detection
+        self._ignored_sessions = set()  # user-removed Codex session IDs (survives until restart)
         self._notif_delegate = _setup_notifications()  # keep ref to prevent GC
         _apply_app_icon(self._config.get("app_icon", "spy-girl"))
 
@@ -870,6 +871,11 @@ class BarSpyApp(rumps.App):
         # --- Codex sessions (from SQLite polling) ---
         codex_sessions = scan_codex_sessions()
         sessions.update(codex_sessions)
+
+        # Drop sessions the user manually removed (Codex re-appears each scan,
+        # so it stays suppressed via the ignore set until app restart).
+        for sid in list(self._ignored_sessions):
+            sessions.pop(sid, None)
 
         # Build status list (sorted by started time for stable ordering)
         sorted_sessions = sorted(sessions.items(), key=lambda x: x[1].get("started", ""))
@@ -999,11 +1005,18 @@ class BarSpyApp(rumps.App):
                     icon = "○"
                 label = f"{icon}  {project} ({agent_tag})  —  {started}"
                 pid = info.get("pid", 0)
-                if info.get("agent_type") == "codex":
-                    cb = (lambda s: lambda _: _activate_codex())(sid)
+                agent_type = info.get("agent_type", "claude")
+                session_item = rumps.MenuItem(label)
+                # Activate: bring the session's app to the foreground.
+                if agent_type == "codex":
+                    activate_cb = (lambda s: lambda _: _activate_codex())(sid)
                 else:
-                    cb = (lambda p: lambda _: _dismiss_attention_for_pid(p))(pid)
-                self.menu.add(rumps.MenuItem(label, callback=cb))
+                    activate_cb = (lambda p: lambda _: _handle_notification_click(p))(pid)
+                session_item["Activate"] = rumps.MenuItem("Activate", callback=activate_cb)
+                # Remove: clear this session from the display.
+                remove_cb = (lambda s, a: lambda _: self._on_remove_session(s, a))(sid, agent_type)
+                session_item["Remove"] = rumps.MenuItem("Remove", callback=remove_cb)
+                self.menu.add(session_item)
 
         self.menu.add(rumps.separator)
 
@@ -1076,6 +1089,22 @@ class BarSpyApp(rumps.App):
         self.menu.add(icon_menu)
 
         self.menu.add(rumps.separator)
+
+    def _on_remove_session(self, sid, agent_type):
+        """Manually clear a session from the display.
+
+        Codex sessions are re-derived from SQLite on every poll, so they are
+        suppressed via the ignore set (until restart). Claude sessions live in
+        sessions.json, so removing the entry clears it until the hook writes a
+        new event for that session.
+        """
+        if agent_type == "codex":
+            self._ignored_sessions.add(sid)
+        else:
+            sessions = read_sessions()
+            sessions.pop(sid, None)
+            write_sessions(sessions)
+        self._last_icon_key = None  # force icon redraw next poll
 
     def _build_color_submenu(self, label, config_key, default_color):
         """Build a color picker submenu with presets + custom hex input."""
