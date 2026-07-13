@@ -2,6 +2,14 @@
 
 Menu bar agent monitor for Claude Code and Codex sessions. Shows colored indicators — one per active session.
 
+## Current Status
+
+Deployed and healthy. Codex subagent filtering + noise-immune liveness shipped 2026-07-13 (`38d5cec`), ad-hoc signed, running from `/Applications/Bar Spy.app`.
+
+**Last session (2026-07-13):** Fixed the runaway-indicator bugs — Codex 0.144's internal subagent threads rendered as duplicate sessions (16 shown vs 4 real), and per-thread background log chatter (MCP keepalives) kept `last_active` fresh forever so ended sessions never hit the 30-min expiry. Mechanics documented in the Codex section below. Discovered en route: no valid codesigning identity remains on this machine — bundle is ad-hoc signed now (Build & Deploy section updated).
+
+**Next steps:** push to GitHub (commits are local-only); watch menu bar counts for a few days. If Codex rotates its state schema again, the `thread_source`/`thread_spawn_edges` queries degrade safely — worst case duplicates return, nothing crashes.
+
 ## How It Works
 
 **Two agent types, one unified display:**
