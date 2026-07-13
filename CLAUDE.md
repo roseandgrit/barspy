@@ -12,9 +12,12 @@ Menu bar agent monitor for Claude Code and Codex sessions. Shows colored indicat
 - Events: `prompt-submit`, `tool-start`, `tool-complete` → working; `stop` → idle; `session-end` → removed
 
 ### Codex (SQLite polling)
-- App polls `~/.codex/logs_1.sqlite` + `state_5.sqlite` every 1 second
+- App polls the latest `~/.codex/logs_N.sqlite` + `state_N.sqlite` every 1 second (numeric suffix rotates; resolved fresh per poll)
 - No Codex configuration changes needed — reads existing log data
-- State detection from log entries: `response.completed` / `turn/completed` → idle; streaming/tool events → working
+- **User threads only:** Codex 0.144+ spawns internal subagent threads (reviews, guardians) that share the parent's title — `thread_source = 'subagent'` rows are hidden, or they'd show as duplicate indicators
+- **Significant targets only:** activity/liveness counts only real work log targets (streaming, turn lifecycle). Background chatter (MCP keepalives, marketplace polls) is attributed to threads but ignored — otherwise finished sessions never age out
+- **Subagent bubbling:** hidden subagent activity counts toward the spawning session's recency (via `thread_spawn_edges`), so a session waiting on its review agents shows working, and a parent's `response.completed` doesn't read as idle while subagents still run
+- State detection from log entries: `response.completed` / `turn/completed` (with nothing after) → idle; recent streaming/tool events → working
 - Sessions are in-memory only (not written to sessions.json)
 - If `~/.codex/` doesn't exist, Codex scanning is silently skipped
 
@@ -25,10 +28,10 @@ Menu bar agent monitor for Claude Code and Codex sessions. Shows colored indicat
 | App | `barspy.py` | rumps menu bar app, polls state, renders indicators |
 | Claude Hook | `~/.claude/scripts/barspy_hook.py` | Sets Claude session status on hook events |
 | Claude State | `~/.barspy/sessions.json` | JSON with session_id → status/pid/project |
-| Codex Logs | `~/.codex/logs_1.sqlite` | Codex activity logs (read-only) |
-| Codex State | `~/.codex/state_5.sqlite` | Codex thread metadata (read-only) |
+| Codex Logs | `~/.codex/logs_N.sqlite` (latest N) | Codex activity logs (read-only) |
+| Codex State | `~/.codex/state_N.sqlite` (latest N) | Codex thread metadata (read-only) |
 | Settings | `~/.claude/settings.json` | Claude hook wiring (6 events) |
-| Bundle | `/Applications/Bar Spy.app` | py2app build, signed with Apple Dev cert |
+| Bundle | `/Applications/Bar Spy.app` | py2app build, ad-hoc signed |
 | LaunchAgent | `~/Library/LaunchAgents/com.barspy.plist` | Auto-start on login |
 | Icon | `assets/BarSpy.icns` | App icon (beret spy girl) |
 
@@ -128,11 +131,13 @@ cd ~/ClaudeProjects/Personal/BarSpy
 kill -9 $(pgrep -f "Bar Spy") 2>/dev/null
 mv "/Applications/Bar Spy.app" "/tmp/BarSpy_old_$(date +%s).app"
 cp -R "dist/Bar Spy.app" "/Applications/Bar Spy.app"
-codesign --force --deep --sign "Your Developer ID" "/Applications/Bar Spy.app"
+codesign --force --deep --sign - "/Applications/Bar Spy.app"
 open "/Applications/Bar Spy.app"
 ```
 
-**Note:** `rm -rf` is blocked by delete_guardian. Use `mv` to `/tmp` instead.
+**Signing:** ad-hoc (`--sign -`) — no valid codesigning identity exists on this machine (verified 2026-07-13; the old "Apple Dev cert" step is dead).
+
+**Note:** `rm -rf` is blocked by delete_guardian. Use `mv` to `/tmp` instead. The `mv` of the old bundle must succeed before the `cp` — `cp -R` onto an existing `.app` nests the bundle inside it and codesign fails with "unsealed contents".
 
 **Important:** Must rebuild with py2app after any code change — the bundle is self-contained. Hook changes (`barspy_hook.py`) take effect immediately (no rebuild needed).
 

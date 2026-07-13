@@ -428,13 +428,39 @@ def _log(msg):
         pass
 
 
+# Log targets that represent real agent work (streaming, turn lifecycle).
+# Codex also logs constant per-thread background chatter (MCP connection
+# keepalives, marketplace polls, feedback tags) — thousands of rows per half
+# hour. That noise must never count as activity, or finished sessions keep
+# their last_active fresh forever and the 30-min expiry can't fire.
+CODEX_SIGNIFICANT_TARGETS = (
+    'codex_api::endpoint::responses_websocket',
+    'codex_api::sse::responses',
+    'codex_core::stream_events_utils',
+    'codex_core::session::turn',
+    'codex_core::session::handlers',
+)
+
+_CODEX_SIG_SQL = ", ".join(f"'{t}'" for t in CODEX_SIGNIFICANT_TARGETS)
+
+# Codex 0.144+ spawns internal subagent threads (reviews, guardians) that
+# share the parent session's title — one visible session can own a dozen of
+# them. Only user-facing threads get an indicator; old schema rows with
+# thread_source NULL are treated as user threads.
+_CODEX_USER_FILTER = "(t.thread_source IS NULL OR t.thread_source != 'subagent')"
+
+
 def scan_codex_sessions():
-    """Scan Codex SQLite databases for active threads. Returns dict of session entries.
+    """Scan Codex SQLite databases for active user threads. Returns dict of session entries.
 
     Reads the latest ~/.codex/logs_*.sqlite for activity and the latest
     ~/.codex/state_*.sqlite for thread metadata (cwd, title). The numeric suffix
     rotates over time, so the actual files are resolved fresh on each poll. No
     Codex config changes needed.
+
+    Subagent threads are hidden, but their activity counts toward the spawning
+    session's recency (via thread_spawn_edges) so a session that is waiting on
+    its subagents still shows as working.
     """
     logs_db = _latest_codex_db("logs")
     state_db = _latest_codex_db("state")
@@ -449,41 +475,85 @@ def scan_codex_sessions():
         conn = sqlite3.connect(f"file:{logs_db}?mode=ro", uri=True, timeout=1)
         conn.execute(f"ATTACH DATABASE 'file:{state_db}?mode=ro' AS state_db")
 
-        # Find threads with recent log activity
-        rows = conn.execute("""
+        # User threads with recent significant activity of their own
+        base_query = f"""
             SELECT
                 l.thread_id,
                 t.cwd,
                 t.title,
-                MAX(l.ts) as last_ts,
+                MAX(l.ts) as own_ts,
                 t.created_at
             FROM logs l
             JOIN state_db.threads t ON l.thread_id = t.id
             WHERE l.thread_id IS NOT NULL
               AND l.ts > ?
               AND t.archived = 0
+              AND l.target IN ({_CODEX_SIG_SQL})
+              AND {_CODEX_USER_FILTER}
             GROUP BY l.thread_id
-            ORDER BY last_ts DESC
-        """, (cutoff,)).fetchall()
+            ORDER BY own_ts DESC
+        """
+        try:
+            rows = conn.execute(base_query, (cutoff,)).fetchall()
+        except sqlite3.OperationalError:
+            # State schema without thread_source — show every thread
+            rows = conn.execute(
+                base_query.replace(f"AND {_CODEX_USER_FILTER}", ""), (cutoff,)
+            ).fetchall()
 
-        for thread_id, cwd, title, last_ts, created_at in rows:
-            # Get the last significant log entry for state detection
-            event_row = conn.execute("""
-                SELECT target, feedback_log_body
+        # Recent subagent activity, attributed to the spawning thread
+        child_ts = {}
+        try:
+            child_rows = conn.execute(f"""
+                SELECT e.parent_thread_id, MAX(l.ts)
+                FROM state_db.thread_spawn_edges e
+                JOIN logs l ON l.thread_id = e.child_thread_id
+                WHERE l.ts > ?
+                  AND l.target IN ({_CODEX_SIG_SQL})
+                GROUP BY e.parent_thread_id
+            """, (cutoff,)).fetchall()
+            child_ts = dict(child_rows)
+        except sqlite3.OperationalError:
+            pass  # schema without spawn edges
+
+        # Parents whose own activity aged out of the window but whose
+        # subagents are still going — they'd otherwise vanish mid-work
+        seen = {r[0] for r in rows}
+        for tid in child_ts:
+            if tid in seen:
+                continue
+            try:
+                meta = conn.execute(f"""
+                    SELECT t.cwd, t.title, t.created_at
+                    FROM state_db.threads t
+                    WHERE t.id = ? AND t.archived = 0 AND {_CODEX_USER_FILTER}
+                """, (tid,)).fetchone()
+            except sqlite3.OperationalError:
+                meta = conn.execute("""
+                    SELECT t.cwd, t.title, t.created_at
+                    FROM state_db.threads t
+                    WHERE t.id = ? AND t.archived = 0
+                """, (tid,)).fetchone()
+            if meta is None:
+                continue  # archived, or a subagent that spawned its own children
+            rows.append((tid, meta[0], meta[1], 0, meta[2]))
+
+        for thread_id, cwd, title, own_ts, created_at in rows:
+            last_active = max(own_ts or 0, child_ts.get(thread_id, 0))
+
+            # Last significant event this thread logged itself (with its ts,
+            # to tell "turn finished" from "subagents still running after it")
+            event_row = conn.execute(f"""
+                SELECT target, feedback_log_body, ts
                 FROM logs
                 WHERE thread_id = ?
-                  AND target IN (
-                    'codex_api::endpoint::responses_websocket',
-                    'codex_api::sse::responses',
-                    'codex_core::stream_events_utils',
-                    'codex_core::session::turn',
-                    'codex_core::session::handlers'
-                  )
+                  AND target IN ({_CODEX_SIG_SQL})
                 ORDER BY ts DESC, ts_nanos DESC
                 LIMIT 1
             """, (thread_id,)).fetchone()
 
-            status = _codex_status_from_log(last_ts, event_row, now)
+            child_last = child_ts.get(thread_id, 0)
+            status = _codex_status_from_log(last_active, event_row, child_last, now)
             if status is None:
                 continue  # dead, skip
 
@@ -498,8 +568,8 @@ def scan_codex_sessions():
                 "cwd": cwd or "",
                 "started": started,
                 "status": status,
-                "last_active": float(last_ts),
-                "last_event": _codex_last_event(event_row),
+                "last_active": float(last_active),
+                "last_event": _codex_last_event(event_row, child_last),
                 "thread_id": thread_id,
             }
 
@@ -533,18 +603,23 @@ def _codex_completed(msg):
             or "turn.completed" in msg)
 
 
-def _codex_status_from_log(last_ts, event_row, now):
-    """Determine Codex session status from the last significant log entry."""
-    age = now - last_ts
+def _codex_status_from_log(last_active, event_row, child_last, now):
+    """Determine Codex session status from the last significant log entry.
 
-    # Dead: no activity in 30 min
+    last_active includes subagent activity; the completed marker only counts
+    when nothing (including subagents) ran after it — a parent logs its
+    response.completed for the dispatch turn while spawned agents keep going.
+    """
+    age = now - last_active
+
+    # Dead: no significant activity (own or subagent) in 30 min
     if age > DEAD_THRESHOLD:
         return None
 
     if event_row:
-        _, body = event_row
-        # Explicit idle: model finished responding
-        if _codex_completed((body or "").lower()):
+        _, body, event_ts = event_row
+        # Explicit idle: model finished responding and nothing ran after
+        if _codex_completed((body or "").lower()) and event_ts >= child_last:
             return "idle"
 
     # Recent activity = working (streaming, tool calls, reasoning, etc.).
@@ -557,14 +632,16 @@ def _codex_status_from_log(last_ts, event_row, now):
     return "idle"
 
 
-def _codex_last_event(event_row):
+def _codex_last_event(event_row, child_last=0):
     """Map Codex log entry to a last_event string for attention logic."""
     if not event_row:
         return ""
-    _, body = event_row
+    _, body, event_ts = event_row
     msg = (body or "").lower()
     if _codex_completed(msg):
-        return "turn-complete"
+        # Only a true end-of-turn is promotable to attention; a completed
+        # marker with subagent activity after it means work is still going
+        return "turn-complete" if event_ts >= child_last else "streaming"
     if "exec_command" in msg or "tool_call" in msg or "toolcall" in msg.replace(" ", ""):
         return "tool-call"
     return "streaming"
