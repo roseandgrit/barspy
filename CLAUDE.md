@@ -8,7 +8,7 @@ Deployed and healthy. Codex guardian-review filtering, Codex quit detection, and
 
 **Last session (2026-10-06):** Codex relabeled its internal review threads (`thread_source = 'guardian_review'`, `source` JSON containing `"subagent"`, no spawn edge), so the 0.144 filter stopped hiding them and each review showed as an idle duplicate for 30 min. Codex app-server PID detection was also broken (the cmdline is now `codex -c ... app-server`), so Codex sessions outlived Codex. Removed the status item hover tooltip; counts stay in the menu header.
 
-**Next steps:** push to GitHub (commits are local-only). If Codex relabels threads again, check `select thread_source, source, count(*) from threads group by 1,2` in the latest `state_N.sqlite` and extend `_CODEX_USER_FILTER`.
+**Next steps:** none open; pushed through `7579a30`. If Codex relabels threads again, check `select thread_source, source, count(*) from threads group by 1,2` in the latest `state_N.sqlite` and extend `_CODEX_USER_FILTER`.
 
 ## How It Works
 
