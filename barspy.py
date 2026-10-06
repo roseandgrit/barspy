@@ -443,11 +443,16 @@ CODEX_SIGNIFICANT_TARGETS = (
 
 _CODEX_SIG_SQL = ", ".join(f"'{t}'" for t in CODEX_SIGNIFICANT_TARGETS)
 
-# Codex 0.144+ spawns internal subagent threads (reviews, guardians) that
-# share the parent session's title — one visible session can own a dozen of
-# them. Only user-facing threads get an indicator; old schema rows with
-# thread_source NULL are treated as user threads.
-_CODEX_USER_FILTER = "(t.thread_source IS NULL OR t.thread_source != 'subagent')"
+# Codex spawns internal threads (reviews, guardians) alongside the user's
+# session — one visible session can own dozens of them. Codex 0.144 tagged them
+# thread_source='subagent'; later builds use 'guardian_review' with a
+# {"subagent": ...} source and no spawn edge. Hide anything that looks internal
+# by any of those markers; thread_source NULL rows are real user threads.
+_CODEX_USER_FILTER = (
+    "(t.thread_source IS NULL OR t.thread_source NOT IN ('subagent', 'guardian_review'))"
+    " AND t.source NOT LIKE '%\"subagent\"%'"
+    " AND t.id NOT IN (SELECT child_thread_id FROM state_db.thread_spawn_edges)"
+)
 
 
 def scan_codex_sessions():
@@ -581,6 +586,8 @@ def scan_codex_sessions():
     # Find Codex app-server PID for liveness check
     if sessions:
         codex_pid = _find_codex_pid()
+        if not codex_pid:
+            return {}  # Codex isn't running — its threads can't be live
         for info in sessions.values():
             info["pid"] = codex_pid
 
@@ -651,7 +658,7 @@ def _find_codex_pid():
     """Find the Codex app-server PID (or main Codex.app PID)."""
     try:
         output = subprocess.check_output(
-            ["pgrep", "-f", "codex app-server"],
+            ["pgrep", "-f", "codex .*app-server"],
             text=True, stderr=subprocess.DEVNULL,
         )
         pids = [int(p) for p in output.strip().split("\n") if p.strip()]
@@ -1013,22 +1020,6 @@ class BarSpyApp(rumps.App):
         self._prev_session_statuses = {
             sid: get_session_status(info, self._config) for sid, info in sorted_sessions
         }
-
-        # Tooltip
-        if not sessions:
-            self._nsapp.nsstatusitem.setToolTip_("No active sessions")
-        else:
-            working = statuses.count("working")
-            attention = statuses.count("attention")
-            idle = len(statuses) - working - attention
-            parts = []
-            if working:
-                parts.append(f"{working} working")
-            if attention:
-                parts.append(f"{attention} waiting")
-            if idle:
-                parts.append(f"{idle} idle")
-            self._nsapp.nsstatusitem.setToolTip_(", ".join(parts))
 
         self._rebuild_menu(sorted_sessions)
 

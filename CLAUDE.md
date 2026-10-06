@@ -4,11 +4,11 @@ Menu bar agent monitor for Claude Code and Codex sessions. Shows colored indicat
 
 ## Current Status
 
-Deployed and healthy. Codex subagent filtering + noise-immune liveness shipped 2026-07-13 (`38d5cec`), ad-hoc signed, running from `/Applications/Bar Spy.app`.
+Deployed and healthy. Codex guardian-review filtering, Codex quit detection, and tooltip removal shipped 2026-10-06, ad-hoc signed, running from `/Applications/Bar Spy.app`.
 
-**Last session (2026-07-13):** Fixed the runaway-indicator bugs — Codex 0.144's internal subagent threads rendered as duplicate sessions (16 shown vs 4 real), and per-thread background log chatter (MCP keepalives) kept `last_active` fresh forever so ended sessions never hit the 30-min expiry. Mechanics documented in the Codex section below. Discovered en route: no valid codesigning identity remains on this machine — bundle is ad-hoc signed now (Build & Deploy section updated).
+**Last session (2026-10-06):** Codex relabeled its internal review threads (`thread_source = 'guardian_review'`, `source` JSON containing `"subagent"`, no spawn edge), so the 0.144 filter stopped hiding them and each review showed as an idle duplicate for 30 min. Codex app-server PID detection was also broken (the cmdline is now `codex -c ... app-server`), so Codex sessions outlived Codex. Removed the status item hover tooltip; counts stay in the menu header.
 
-**Next steps:** push to GitHub (commits are local-only); watch menu bar counts for a few days. If Codex rotates its state schema again, the `thread_source`/`thread_spawn_edges` queries degrade safely — worst case duplicates return, nothing crashes.
+**Next steps:** push to GitHub (commits are local-only). If Codex relabels threads again, check `select thread_source, source, count(*) from threads group by 1,2` in the latest `state_N.sqlite` and extend `_CODEX_USER_FILTER`.
 
 ## How It Works
 
@@ -22,7 +22,7 @@ Deployed and healthy. Codex subagent filtering + noise-immune liveness shipped 2
 ### Codex (SQLite polling)
 - App polls the latest `~/.codex/logs_N.sqlite` + `state_N.sqlite` every 1 second (numeric suffix rotates; resolved fresh per poll)
 - No Codex configuration changes needed — reads existing log data
-- **User threads only:** Codex 0.144+ spawns internal subagent threads (reviews, guardians) that share the parent's title — `thread_source = 'subagent'` rows are hidden, or they'd show as duplicate indicators
+- **User threads only:** Codex spawns internal threads (reviews, guardians) beside the user's session. Hidden if `thread_source` is `subagent` (0.144) or `guardian_review` (later builds), if `source` contains `"subagent"`, or if the thread is a child in `thread_spawn_edges`. `thread_source IS NULL` rows are real user threads
 - **Significant targets only:** activity/liveness counts only real work log targets (streaming, turn lifecycle). Background chatter (MCP keepalives, marketplace polls) is attributed to threads but ignored — otherwise finished sessions never age out
 - **Subagent bubbling:** hidden subagent activity counts toward the spawning session's recency (via `thread_spawn_edges`), so a session waiting on its review agents shows working, and a parent's `response.completed` doesn't read as idle while subagents still run
 - State detection from log entries: `response.completed` / `turn/completed` (with nothing after) → idle; recent streaming/tool events → working
@@ -100,7 +100,7 @@ Removal is for clearing sessions you don't care about now; auto-cleanup (below) 
 
 ## Safety Features
 
-- **PID liveness check:** Every poll checks if session PID is alive. Dead Claude process → indicator removed within 1s. Codex sessions track the app-server PID — if Codex.app quits, all Codex indicators are removed.
+- **PID liveness check:** Every poll checks if session PID is alive. Dead Claude process: indicator removed within 1s. Codex sessions track the app-server PID (`pgrep -f "codex .*app-server"`); if none is found, no Codex sessions are shown.
 - **PID dedup:** If multiple Claude session IDs share a PID (from /exit + resume), keeps only the most recently active.
 - **30-min timeout:** Fallback cleanup for sessions with no activity. Applies to both Claude (JSON) and Codex (SQLite log age).
 - **Graceful degradation:** If `~/.codex/` doesn't exist or SQLite is locked/corrupt, Codex scanning is silently skipped.
