@@ -84,6 +84,23 @@ ATTENTION_DELAY_LABELS = [
     ("10min", "10 minutes"),
 ]
 
+# Desktop-app sessions with Remote Control on keep their process alive after the
+# user is done, so the PID check never clears them. A Claude session that ended
+# its turn (last event "stop") and stayed quiet this long is cleared.
+IDLE_CLEAR_DELAYS = {
+    "5min": 300.0,
+    "10min": 600.0,
+    "15min": 900.0,
+    "30min": 1800.0,
+}
+
+IDLE_CLEAR_LABELS = [
+    ("5min", "5 minutes"),
+    ("10min", "10 minutes (default)"),
+    ("15min", "15 minutes"),
+    ("30min", "30 minutes"),
+]
+
 LOG_FILE = Path.home() / ".barspy" / "debug.log"
 
 # Default palette
@@ -104,6 +121,7 @@ DEFAULT_CONFIG = {
     "notifications": True,
     "app_icon": "spy-girl",
     "attention_delay": "5min",
+    "idle_clear": "10min",
 }
 
 APP_ICON_CHOICES = [
@@ -177,6 +195,8 @@ def load_config():
                 data["throb_speed"] = "medium"
             if data.get("attention_delay") not in ATTENTION_DELAYS:
                 data["attention_delay"] = "5min"
+            if data.get("idle_clear") not in IDLE_CLEAR_DELAYS:
+                data["idle_clear"] = "10min"
             valid_icons = {k for k, _ in APP_ICON_CHOICES}
             if data.get("app_icon") not in valid_icons:
                 data["app_icon"] = "spy-girl"
@@ -725,6 +745,18 @@ def is_session_dead(info):
     return (time.time() - last_active) > DEAD_THRESHOLD
 
 
+def is_idle_expired(info, config):
+    """True if a Claude session finished its turn and has been quiet past the idle-clear delay."""
+    if info.get("agent_type", "claude") != "claude" or info.get("last_event") != "stop":
+        return False
+    last_active = info.get("last_active", 0.0)
+    if last_active == 0.0:
+        return False
+    delay_key = (config or {}).get("idle_clear", "10min")
+    threshold = IDLE_CLEAR_DELAYS.get(delay_key, IDLE_CLEAR_DELAYS["10min"])
+    return (time.time() - last_active) > threshold
+
+
 def _get_icon_path(icon_key):
     """Get path to the icon PNG for the given app_icon key.
 
@@ -944,9 +976,11 @@ class BarSpyApp(rumps.App):
                 del sessions[sid]
             write_sessions(sessions)
 
-        # Cleanup: remove Claude sessions whose process is dead OR inactive 30+ min
+        # Cleanup: remove Claude sessions whose process is dead, inactive 30+ min,
+        # or idle after a finished turn past the idle-clear delay
         dead_ids = [sid for sid, info in sessions.items()
-                     if is_session_dead(info) or not is_pid_alive(info.get("pid", 0))]
+                     if is_session_dead(info) or not is_pid_alive(info.get("pid", 0))
+                     or is_idle_expired(info, self._config)]
         if dead_ids:
             for sid in dead_ids:
                 del sessions[sid]
@@ -1146,6 +1180,16 @@ class BarSpyApp(rumps.App):
             attn_menu[delay_label] = item
         self.menu.add(attn_menu)
 
+        # Idle clear submenu
+        idle_menu = rumps.MenuItem("Clear Idle After")
+        current_idle = self._config.get("idle_clear", "10min")
+        for clear_key, clear_label in IDLE_CLEAR_LABELS:
+            item = rumps.MenuItem(clear_label, callback=self._on_idle_clear_select)
+            if current_idle == clear_key:
+                item.state = 1
+            idle_menu[clear_label] = item
+        self.menu.add(idle_menu)
+
         # App icon submenu
         icon_menu = rumps.MenuItem("App Icon")
         current_icon = self._config.get("app_icon", "spy-girl")
@@ -1244,6 +1288,13 @@ class BarSpyApp(rumps.App):
         for delay_key, delay_label in ATTENTION_DELAY_LABELS:
             if delay_label == sender.title:
                 self._config["attention_delay"] = delay_key
+                save_config(self._config)
+                return
+
+    def _on_idle_clear_select(self, sender):
+        for clear_key, clear_label in IDLE_CLEAR_LABELS:
+            if clear_label == sender.title:
+                self._config["idle_clear"] = clear_key
                 save_config(self._config)
                 return
 

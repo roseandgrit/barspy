@@ -4,11 +4,11 @@ Menu bar agent monitor for Claude Code and Codex sessions. Shows colored indicat
 
 ## Current Status
 
-Deployed and healthy. Codex guardian-review filtering, Codex quit detection, and tooltip removal shipped 2026-10-06, ad-hoc signed, running from `/Applications/Bar Spy.app`.
+Deployed and healthy. Idle-clear for Claude sessions shipped 2026-10-09, ad-hoc signed, running from `/Applications/Bar Spy.app`.
 
-**Last session (2026-10-06):** Codex relabeled its internal review threads (`thread_source = 'guardian_review'`, `source` JSON containing `"subagent"`, no spawn edge), so the 0.144 filter stopped hiding them and each review showed as an idle duplicate for 30 min. Codex app-server PID detection was also broken (the cmdline is now `codex -c ... app-server`), so Codex sessions outlived Codex. Removed the status item hover tooltip; counts stay in the menu header.
+**Last session (2026-10-09):** Desktop-app sessions with Remote Control on keep their CLI process alive after the user is done, so the PID check never cleared them and they sat for up to 30 min. Added **Clear Idle After** (default 10 min): a Claude session whose last event is `stop` and has been quiet past the delay is removed. Verified live: a session idle since 14:12:56 cleared at 14:22:58.
 
-**Next steps:** none open; pushed through `7579a30`. If Codex relabels threads again, check `select thread_source, source, count(*) from threads group by 1,2` in the latest `state_N.sqlite` and extend `_CODEX_USER_FILTER`.
+**Next steps:** none open. If finished sessions still linger, check `last_event` in `~/.barspy/sessions.json`; only `stop` is eligible for idle-clear.
 
 ## How It Works
 
@@ -85,7 +85,8 @@ Config stored at `~/.barspy/config.json`:
   "color_idle": [0.706, 0.624, 0.863],
   "throb_speed": "medium",
   "notifications": true,
-  "attention_delay": "5min"
+  "attention_delay": "5min",
+  "idle_clear": "10min"
 }
 ```
 Validated on load; bad values fall back to defaults.
@@ -102,6 +103,7 @@ Removal is for clearing sessions you don't care about now; auto-cleanup (below) 
 
 - **PID liveness check:** Every poll checks if session PID is alive. Dead Claude process: indicator removed within 1s. Codex sessions track the app-server PID (`pgrep -f "codex .*app-server"`); if none is found, no Codex sessions are shown.
 - **PID dedup:** If multiple Claude session IDs share a PID (from /exit + resume), keeps only the most recently active.
+- **Idle clear:** Claude sessions whose last event is `stop` are removed after the **Clear Idle After** delay (5 / 10 default / 15 / 30 min). Needed because desktop-app sessions with Remote Control on keep their process alive after the user is done, so the PID check never fires. Working and attention sessions are never idle-cleared.
 - **30-min timeout:** Fallback cleanup for sessions with no activity. Applies to both Claude (JSON) and Codex (SQLite log age).
 - **Graceful degradation:** If `~/.codex/` doesn't exist or SQLite is locked/corrupt, Codex scanning is silently skipped.
 
