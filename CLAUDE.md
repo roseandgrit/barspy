@@ -4,11 +4,11 @@ Menu bar agent monitor for Claude Code and Codex sessions. Shows colored indicat
 
 ## Current Status
 
-Deployed and healthy. Idle-clear for Claude sessions shipped 2026-10-09, ad-hoc signed, running from `/Applications/Bar Spy.app`.
+Deployed and healthy. Menu item leak fixed 2026-11-22 (`9f5fdfd`), ad-hoc signed, running from `/Applications/Bar Spy.app`.
 
-**Last session (2026-10-09):** Desktop-app sessions with Remote Control on keep their CLI process alive after the user is done, so the PID check never cleared them and they sat for up to 30 min. Added **Clear Idle After** (default 10 min): a Claude session whose last event is `stop` and has been quiet past the delay is removed. Verified live: a session idle since 14:12:56 cleared at 14:22:58.
+**Last session (2026-11-22):** The app reached 3.4 GB RSS after 5 days. The menu was rebuilt every 1s poll and rumps keeps every MenuItem with a callback in `NSApp._ns_to_py_and_callback`, which `Menu.clear()` never empties: 27.9M NSMenuItems live [heap]. Fix: rebuild only when sessions, statuses or config change (`_last_menu_key`), and `_purge_menu_callbacks` before each rebuild. Verified live: 70 NSMenuItem at 0:18, 1:19 and 2:20 uptime, RSS 150 MB.
 
-**Next steps:** none open. If finished sessions still linger, check `last_event` in `~/.barspy/sessions.json`; only `stop` is eligible for idle-clear.
+**Next steps:** none open. Multi-day RSS not yet observed; check with `ps -o rss= -p $(pgrep -f "Bar Spy")`. If finished sessions still linger, check `last_event` in `~/.barspy/sessions.json`; only `stop` is eligible for idle-clear.
 
 ## How It Works
 
