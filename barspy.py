@@ -936,6 +936,7 @@ class BarSpyApp(rumps.App):
         )
         self._initialized = False
         self._last_icon_key = None
+        self._last_menu_key = None
         self._config = load_config()
         self._throb_phase = 0.0
         self._current_statuses = []
@@ -1055,7 +1056,19 @@ class BarSpyApp(rumps.App):
             sid: get_session_status(info, self._config) for sid, info in sorted_sessions
         }
 
-        self._rebuild_menu(sorted_sessions)
+        # Rebuild the menu only when what it shows has changed. Rebuilding
+        # every poll leaked ~64 NSMenuItems per second (see _purge_menu_callbacks).
+        menu_key = (
+            tuple(
+                (sid, info.get("project"), info.get("started"), info.get("agent_type"),
+                 info.get("pid"), status)
+                for (sid, info), status in zip(sorted_sessions, statuses)
+            ),
+            json.dumps(self._config, sort_keys=True, default=str),
+        )
+        if menu_key != self._last_menu_key:
+            self._last_menu_key = menu_key
+            self._rebuild_menu(sorted_sessions)
 
     @rumps.timer(0.05)
     def animate(self, _):
@@ -1074,7 +1087,22 @@ class BarSpyApp(rumps.App):
         if img:
             self._nsapp.nsstatusitem.setImage_(img)
 
+    @staticmethod
+    def _purge_menu_callbacks(menu):
+        """Drop rumps' callback-registry entries for every item under `menu`.
+
+        rumps keeps each MenuItem that has a callback in a class-level dict
+        (NSApp._ns_to_py_and_callback) and Menu.clear() never removes them, so
+        cleared items would otherwise stay alive for the life of the process.
+        """
+        registry = rumps.rumps.NSApp._ns_to_py_and_callback
+        for item in list(menu.values()):
+            if isinstance(item, rumps.MenuItem):
+                BarSpyApp._purge_menu_callbacks(item)
+                registry.pop(item._menuitem, None)
+
     def _rebuild_menu(self, sorted_sessions):
+        self._purge_menu_callbacks(self.menu)
         self.menu.clear()
 
         if not sorted_sessions:
